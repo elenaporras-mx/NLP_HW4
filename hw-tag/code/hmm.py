@@ -346,15 +346,36 @@ class HiddenMarkovModel:
         isent = self._integerize_sentence(sentence, corpus)
 
         # See comments in log_forward on preallocation of alpha.
-        alpha        = [torch.empty(self.k)                  for _ in isent]  
+        alpha = [torch.full((self.k,), float('-inf')) for _ in isent]  # initialize to log(0) = -inf
         backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
-        tags: List[int]    # you'll put your integerized tagging here
+        
+        alpha[0] = torch.log(self.eye[self.bos_t])
+        
+        # forward pass based on alg 4
+        for j in range(1, len(isent)):
+            word_id = isent[j][0]
+            
+            for t in range(self.k):  # current tag
+                for s in range(self.k):  # previous tag
+                    if j == len(isent)-1:
+                        score = alpha[j-1][s] + torch.log(self.A[s,self.eos_t])
+                    else:
+                        score = alpha[j-1][s] + torch.log(self.A[s,t]) + torch.log(self.B[t,word_id])
+                    
+                    if score > alpha[j][t]:
+                        alpha[j][t] = score
+                        backpointers[j][t] = s
 
-        raise NotImplementedError   # you fill this in!
+        tags = [self.bos_t]
+        # Start from EOS tag for last word
+        current_tag = self.eos_t
+        for j in range(len(isent)-1, 0, -1):
+            tags.insert(1, current_tag) # insert after BOS
+            current_tag = backpointers[j][current_tag]
 
         # Make a new tagged sentence with the old words and the chosen tags
         # (using self.tagset to deintegerize the chosen tags).
-        return Sentence([(word, self.tagset[tags[j]]) for j, (word, tag) in enumerate(sentence)])
+        return Sentence([(word, self.tagset[tags[j]]) for j, (word, _) in enumerate(sentence)])
 
     def save(self, model_path: Path) -> None:
         logger.info(f"Saving model to {model_path}")
