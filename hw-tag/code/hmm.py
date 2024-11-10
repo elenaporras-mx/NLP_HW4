@@ -154,6 +154,11 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
+        # Debug: Print initial counts
+        print("\nBefore M-step:")
+        print("A counts:\n", self.A_counts)
+        print("B counts:\n", self.B_counts)
+
         # we should have seen no "tag -> BOS" or "BOS -> tag" transitions
         assert self.A_counts[:, self.bos_t].any() == 0, 'Your expected transition counts ' \
                 'to BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
@@ -165,7 +170,7 @@ class HiddenMarkovModel:
                 'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
 
-        # Update emission probabilities (self.B).
+        # given : Update emission probabilities (self.B).
         self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
         self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
         self.B[self.eos_t, :] = 0   # RESOLVED - replace these nan values with structural zeroes, just as in init_params
@@ -187,6 +192,22 @@ class HiddenMarkovModel:
             # normalize same as init
             self.A = WA.softmax(dim=1) 
 
+        # Debug: Print final matrices
+        print("\nAfter M-step:")
+        print("A matrix:\n", self.A)
+        print("B matrix:\n", self.B)
+        
+        # Debug: Print row sums to verify normalization
+        print("\nVerification:")
+        print("A row sums:", self.A.sum(dim=1))
+        print("B row sums:", self.B.sum(dim=1))
+        
+        # Print specific probabilities that match spreadsheet
+        print("\nKey probabilities (compare with spreadsheet):")
+        print(f"p(C|H) = {self.A[1,0]:.4f}")  # H->C transition
+        print(f"p(H|C) = {self.A[0,1]:.4f}")  # C->H transition
+        print(f"p(1|C) = {self.B[0,0]:.4f}")  # C emits 1
+        print(f"p(3|H) = {self.B[1,2]:.4f}")  # H emits 3
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -294,15 +315,28 @@ class HiddenMarkovModel:
         
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
-
-        # Forward-backward algorithm.
-        log_Z_forward = self.forward_pass(isent)
-        log_Z_backward = self.backward_pass(isent, mult=mult)
         
-        # Check that forward and backward passes found the same total
-        # probability of all paths (up to floating-point error).
-        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
+        print("\nProcessing sentence:", isent)
 
+        # currently stuck here .. the indexes are weird and other strange errors
+        for j in range(1, len(isent)):
+            word_id, tag_id = isent[j]
+            prev_word_id, prev_tag_id = isent[j-1] # I think this is good to have, but it could also b useless
+            
+            if tag_id is not None:  # we have a tag
+                
+                self.B_counts[tag_id, word_id] += mult
+                print(f"Added emission count: tag={tag_id}, word={word_id}, count={mult}")
+                
+                if prev_tag_id is not None:
+                    self.A_counts[prev_tag_id, tag_id] += mult
+                    print(f"Added transition count: prev_tag={prev_tag_id}, tag={tag_id}, count={mult}")
+        
+        # Debug output: show accumulated counts
+        print("\nCurrent counts after this sentence:")
+        print("A_counts:\n", self.A_counts)
+        print("B_counts:\n", self.B_counts)
+        
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
         """Run the forward algorithm from the handout on a tagged, untagged, 
@@ -319,16 +353,51 @@ class HiddenMarkovModel:
         # But to better match the notation in the handout, we'll instead
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
-        alpha = [torch.empty(self.k) for _ in isent]    
-        alpha[0] = self.eye[self.bos_t]  # vector that is one-hot at BOS_TAG
+        
+        # same as the first thing - the viterbi 
+        n = len(isent) - 2  # exclude BOS and EOS
+        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
+    
+
+        self.alpha = [torch.full((self.k,), float('-inf')) for _ in isent]
+        self.alpha[0] = torch.log(self.eye[self.bos_t])
+
+        # Forward pass - same approach as the viterbi algo w slight chnages 
+        for j in range(1, n +1):
+            word_id= isent[j][0]
+            
+            for t in valid_tags:  
+                for s in valid_tags: 
+                    if self.A[s,t] > 0 and self.B[t,word_id] > 0:
+                        term = (self.alpha[j-1][s] + 
+                            torch.log(self.A[s,t]) + 
+                            torch.log(self.B[t,word_id]))
+                        
+                        # adding in log space
+                        if self.alpha[j][t] == float('-inf'):
+                            self.alpha[j][t] = term
+                        else:
+                            self.alpha[j][t] = torch.logsumexp(
+                                torch.tensor([self.alpha[j][t], term]), dim=0)
+        
+        # similar as well to Viterbis, handling the EOS transition
+        for s in valid_tags:
+            if self.A[s,self.eos_t] > 0:
+                term = self.alpha[n][s] + torch.log(self.A[s,self.eos_t])
+                if self.alpha[n+1][self.eos_t] == float('-inf'):
+                    self.alpha[n+1][self.eos_t] = term
+                else:
+                    self.alpha[n+1][self.eos_t] = torch.logsumexp(
+                        torch.tensor([self.alpha[n+1][self.eos_t], term]), dim=0)
+    
+        # reps the probability of getting to EOS
+        self.log_Z = self.alpha[-1][self.eos_t]
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
             # English tagging data. See section C in the reading handout.
-        
-        raise NotImplementedError   # you fill this in!
 
-        return log_Z
+        return self.log_Z
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
@@ -352,6 +421,7 @@ class HiddenMarkovModel:
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
         """Find the most probable tagging for the given sentence, according to the
         current model."""
+
 
         # Note: This code is mainly copied from the forward algorithm.
         # We just switch to using max, and follow backpointers.
@@ -403,7 +473,7 @@ class HiddenMarkovModel:
                 alpha[j][t] = max_score
                 backpointers[j][t] = best_s
 
-        # transitio to EOS at position n+1
+        # transition to EOS at position n+1
         max_score = float('-inf')
         best_s = -1
         for s in valid_tags:
