@@ -97,6 +97,7 @@ class HiddenMarkovModel:
         # (instead, they have probability 1 of emitting EOS_WORD and BOS_WORD (respectively), 
         # which don't have columns in this matrix).
         ###
+
         WB = 0.01*torch.rand(self.k, self.V)  # choose random logits
         self.B = WB.softmax(dim=1)            # construct emission distributions p(w | t)
         self.B[self.eos_t, :] = 0             # EOS_TAG can't emit any column's word
@@ -106,6 +107,7 @@ class HiddenMarkovModel:
         # Randomly initialize transition probabilities, in a similar way.
         # Again, we respect the structural zeros of the model.
         ###
+        
         rows = 1 if self.unigram else self.k
         WA = 0.01*torch.rand(rows, self.k)
         WA[:, self.bos_t] = -inf    # correct the BOS_TAG column
@@ -120,6 +122,15 @@ class HiddenMarkovModel:
             # although unfortunately that preserves the O(nk^2) runtime instead
             # of letting us speed up to O(nk) in the unigram case.
             self.A = self.A.repeat(self.k, 1)   # copy the single row k times  
+
+        # Verify indices match expectations
+        assert self.tagset.index(Tag('C')) == 0
+        assert self.tagset.index(Tag('H')) == 1
+        assert self.eos_t == 2
+        assert self.bos_t == 3
+        assert self.vocab.index(Word('1')) == 0
+        assert self.vocab.index(Word('2')) == 1
+        assert self.vocab.index(Word('3')) == 2
 
     def printAB(self) -> None:
         """Print the A and B matrices in a more human-readable format (tab-separated)."""
@@ -344,38 +355,80 @@ class HiddenMarkovModel:
         # conforms to the type annotations ...)
 
         isent = self._integerize_sentence(sentence, corpus)
+        n = len(isent) - 2  # exclude BOS and EOS
+        
+        # exclusing BOS and EOS 
+        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
 
-        # See comments in log_forward on preallocation of alpha.
-        alpha = [torch.full((self.k,), float('-inf')) for _ in isent]  # initialize to log(0) = -inf
-        backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
-        
-        alpha[0] = torch.log(self.eye[self.bos_t])
-        
-        # forward pass based on alg 4
-        for j in range(1, len(isent)):
+        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
+        backpointers = [torch.full((self.k,), -1, dtype=torch.int) for _ in range(n + 2)]
+
+        # (log probability of 1)
+        alpha[0][self.bos_t] = 0
+
+        # for position 1, first word after BOS
+        word_id = isent[1][0]
+        for t in valid_tags:
+            if self.A[self.bos_t, t] > 0 and self.B[t, word_id] > 0:
+                alpha[1][t] = alpha[0][self.bos_t] + torch.log(self.A[self.bos_t, t]) + torch.log(self.B[t, word_id])
+                backpointers[1][t] = self.bos_t
+            else:
+                # for zero probabilities
+                alpha[1][t] = float('-inf')
+                backpointers[1][t] = -1
+
+        # Forward pass
+        for j in range(2, n + 1):  # Positions 2 to n
             word_id = isent[j][0]
-            
-            for t in range(self.k):  # current tag
-                for s in range(self.k):  # previous tag
-                    if j == len(isent)-1:
-                        score = alpha[j-1][s] + torch.log(self.A[s,self.eos_t])
-                    else:
-                        score = alpha[j-1][s] + torch.log(self.A[s,t]) + torch.log(self.B[t,word_id])
-                    
-                    if score > alpha[j][t]:
-                        alpha[j][t] = score
-                        backpointers[j][t] = s
+            for t in valid_tags:
+                max_score = float('-inf')
+                best_s = -1
+                for s in valid_tags:
+                    if self.A[s, t] > 0 and self.B[t, word_id] > 0 and alpha[j - 1][s] > float('-inf'):
+                        score = alpha[j - 1][s] + torch.log(self.A[s, t]) + torch.log(self.B[t, word_id])
+                        if score > max_score:
+                            max_score = score
+                            best_s = s
+                alpha[j][t] = max_score
+                backpointers[j][t] = best_s
 
-        tags = [self.bos_t]
-        # Start from EOS tag for last word
+        # transitio to EOS at position n+1
+        max_score = float('-inf')
+        best_s = -1
+        for s in valid_tags:
+            if self.A[s, self.eos_t] > 0 and alpha[n][s] > float('-inf'):
+                score = alpha[n][s] + torch.log(self.A[s, self.eos_t])
+                if score > max_score:
+                    max_score = score
+                    best_s = s
+        alpha[n + 1][self.eos_t] = max_score
+        backpointers[n + 1][self.eos_t] = best_s
+
+        # Backtracking
+        tags = []
         current_tag = self.eos_t
-        for j in range(len(isent)-1, 0, -1):
-            tags.insert(1, current_tag) # insert after BOS
-            current_tag = backpointers[j][current_tag]
+        for j in range(n + 1, 0, -1): 
+            prev_tag = backpointers[j][current_tag]
+            if prev_tag == -1:
+                raise ValueError(f"No valid path at position {j}")
+            if j != 0 and current_tag != self.eos_t and current_tag != self.bos_t:
+                tags.insert(0, current_tag)
+            current_tag = prev_tag
 
-        # Make a new tagged sentence with the old words and the chosen tags
-        # (using self.tagset to deintegerize the chosen tags).
-        return Sentence([(word, self.tagset[tags[j]]) for j, (word, _) in enumerate(sentence)])
+        # now include BOS and EOS
+        result = []
+        tags_index = 0  
+        for j, (word, _) in enumerate(sentence):
+            if j == 0:  # BOS
+                result.append((word, BOS_TAG))
+            elif j == len(sentence) - 1:  # EOS
+                result.append((word, EOS_TAG))
+            else:
+                result.append((word, self.tagset[tags[tags_index]]))
+                tags_index += 1
+        return Sentence(result)
+            
+
 
     def save(self, model_path: Path) -> None:
         logger.info(f"Saving model to {model_path}")
