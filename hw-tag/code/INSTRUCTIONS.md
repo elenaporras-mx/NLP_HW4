@@ -160,6 +160,15 @@ paths. This should match the results on [the original
 spreadsheet](http://cs.jhu.edu/~jason/465/hw-tag/hmm.xls), and you can compare
 the intermediate results to catch any bugs.
 
+# Forward-backward algorithm.
+        log_Z_forward = self.forward_pass(isent)
+        log_Z_backward = self.backward_pass(isent, mult=mult)
+        
+        # Check that forward and backward passes found the same total
+        # probability of all paths (up to floating-point error).
+        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
+
+
 ### Step 4: Full E step
 
 You now want to run `train()` on the *unsupervised* `icraw` corpus. In general,

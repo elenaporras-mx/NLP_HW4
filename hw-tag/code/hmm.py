@@ -154,11 +154,12 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
-        # Debug: Print initial counts
-        print("\nBefore M-step:")
-        print("A counts:\n", self.A_counts)
-        print("B counts:\n", self.B_counts)
-
+        # # guarding against possible problems
+        if λ < 0:
+            raise ValueError("Smoothing parameter must be non-negative")
+        if not hasattr(self, 'A_counts') or not hasattr(self, 'B_counts'):
+            raise RuntimeError("No counts accumulated. Run E_step first.")
+        
         # we should have seen no "tag -> BOS" or "BOS -> tag" transitions
         assert self.A_counts[:, self.bos_t].any() == 0, 'Your expected transition counts ' \
                 'to BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
@@ -169,46 +170,48 @@ class HiddenMarkovModel:
         assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
                 'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
-
-        # given : Update emission probabilities (self.B).
-        self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
-        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
-        self.B[self.eos_t, :] = 0   # RESOLVED - replace these nan values with structural zeroes, just as in init_params
-        self.B[self.bos_t, :] = 0
+        # emission probabilities with numerical safeguards
+        smoothed_B_counts = self.B_counts.clone()
+        # given but tweaked for safety : Update emission probabilities (self.B).
+        smoothed_B_counts[:self.eos_t, :] += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
+        row_sums_B = smoothed_B_counts.sum(dim=1, keepdim=True)
+        row_sums_B = torch.where(row_sums_B == 0, torch.ones_like(row_sums_B), row_sums_B)
+        self.B = smoothed_B_counts / row_sums_B
+        self.B[self.eos_t:, :] = 0  # Ensure structural zeros
 
      
         if self.unigram: #uni case 
             row_counts = self.A_counts.sum(dim=0) + λ  # sum over previous tags
-            WA = torch.log(row_counts).unsqueeze(0)  # make it a 1xk matrix
+            # avoiding log(0) by adding small epsilon where needed
+            WA = torch.log(row_counts + 1e-10).unsqueeze(0)  # make it a 1xk matrix
             WA[:, self.bos_t] = -float('inf')
              # normalize same as init 
             self.A = WA.softmax(dim=1) 
             self.A = self.A.repeat(self.k, 1) # copy step
         else:
             # bigram model
-            WA = torch.log(self.A_counts + λ)
-            WA[:, self.bos_t] = -float('inf') 
-            WA[self.eos_t, :] = -float('inf') 
-            # normalize same as init
-            self.A = WA.softmax(dim=1) 
+            smoothed_counts = self.A_counts.clone()
+            smoothed_counts[:self.eos_t, :] += λ
+            row_sums = smoothed_counts.sum(dim=1, keepdim= True)
+            row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
+            self.A = smoothed_counts / row_sums
+            # set structural zeros
+            self.A[:, self.bos_t] = 0  # no transitions to BOS
+            self.A[self.eos_t, :] = 0  # no transitions from EOS
 
         # Debug: Print final matrices
         print("\nAfter M-step:")
         print("A matrix:\n", self.A)
         print("B matrix:\n", self.B)
-        
-        # Debug: Print row sums to verify normalization
-        print("\nVerification:")
-        print("A row sums:", self.A.sum(dim=1))
-        print("B row sums:", self.B.sum(dim=1))
-        
-        # Print specific probabilities that match spreadsheet
-        print("\nKey probabilities (compare with spreadsheet):")
-        print(f"p(C|H) = {self.A[1,0]:.4f}")  # H->C transition
-        print(f"p(H|C) = {self.A[0,1]:.4f}")  # C->H transition
-        print(f"p(1|C) = {self.B[0,0]:.4f}")  # C emits 1
-        print(f"p(3|H) = {self.B[1,2]:.4f}")  # H emits 3
 
+        # debugging :  probabilities sum to 1 where they should
+        A_row_sums = self.A[:self.eos_t].sum(dim=1)
+        B_row_sums = self.B[:self.eos_t].sum(dim=1)
+        assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-5), \
+            "Transition probabilities don't sum to 1"
+        assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-5), \
+            "Emission probabilities don't sum to 1"
+        
     def _zero_counts(self):
         """Set the expected counts to 0.  
         (This creates the count attributes if they didn't exist yet.)"""
@@ -316,22 +319,46 @@ class HiddenMarkovModel:
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
         
+        #  guarding against potential issues 
+        if not isent:
+            raise ValueError("Empty sentence")
+        if mult <= 0:
+            raise ValueError("Multiplier must be positive")
+        if len(isent) < 3:  # Must have at least BOS, one word, EOS
+            raise ValueError("Sentence too short")
+        
+        # Initialize count matrices if they don't exist
+        if not hasattr(self, 'A_counts'):
+            self._zero_counts()
+
         print("\nProcessing sentence:", isent)
 
+        # initial transition special case 
+        first_tag = isent[1][1]  # first real tag after BOS
+        if first_tag is not None:
+            if not 0 <= first_tag < self.k:
+                raise ValueError(f"Invalid tag index: {first_tag}")
+            self.A_counts[self.bos_t, first_tag] += mult
+
+
         # currently stuck here .. the indexes are weird and other strange errors
-        for j in range(1, len(isent)):
+        for j in range(1, len(isent)-1): # skip EOS And BOS
             word_id, tag_id = isent[j]
-            prev_word_id, prev_tag_id = isent[j-1] # I think this is good to have, but it could also b useless
+            _, prev_tag_id = isent[j-1] 
             
             if tag_id is not None:  # we have a tag
                 
-                self.B_counts[tag_id, word_id] += mult
-                print(f"Added emission count: tag={tag_id}, word={word_id}, count={mult}")
+                if word_id < self.V: 
+
+                    self.B_counts[tag_id, word_id] += mult
                 
                 if prev_tag_id is not None:
                     self.A_counts[prev_tag_id, tag_id] += mult
-                    print(f"Added transition count: prev_tag={prev_tag_id}, tag={tag_id}, count={mult}")
         
+        last_tag =isent[-2][1] # tage bfore EOS
+        if last_tag is not None:
+            self.A_counts[last_tag, self.eos_t] += mult
+    
         # Debug output: show accumulated counts
         print("\nCurrent counts after this sentence:")
         print("A_counts:\n", self.A_counts)
