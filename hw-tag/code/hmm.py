@@ -154,28 +154,39 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
-        # we should have seen no emissions from BOS or EOS tags
-        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
-                'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
-
-        # Update emission probabilities (self.B).
-        self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
-        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
-        self.B[self.eos_t, :] = 0   # replace these nan values with structural zeroes, just as in init_params
-        self.B[self.bos_t, :] = 0
-
         # we should have seen no "tag -> BOS" or "BOS -> tag" transitions
         assert self.A_counts[:, self.bos_t].any() == 0, 'Your expected transition counts ' \
                 'to BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
         assert self.A_counts[self.eos_t, :].any() == 0, 'Your expected transition counts ' \
                 'from EOS are not all zero, meaning you\'ve accumulated them incorrectly!'
-                
-        # Update transition probabilities (self.A).  
-        # Don't forget to respect the settings self.unigram and λ.
-        # See the init_params() method for a discussion of self.A in the
-        # unigram case.
-        
-        raise NotImplementedError   # you fill this in!
+
+        # we should have seen no emissions from BOS or EOS tags
+        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
+                'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
+
+
+        # Update emission probabilities (self.B).
+        self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
+        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
+        self.B[self.eos_t, :] = 0   # RESOLVED - replace these nan values with structural zeroes, just as in init_params
+        self.B[self.bos_t, :] = 0
+
+     
+        if self.unigram: #uni case 
+            row_counts = self.A_counts.sum(dim=0) + λ  # sum over previous tags
+            WA = torch.log(row_counts).unsqueeze(0)  # make it a 1xk matrix
+            WA[:, self.bos_t] = -float('inf')
+             # normalize same as init 
+            self.A = WA.softmax(dim=1) 
+            self.A = self.A.repeat(self.k, 1) # copy step
+        else:
+            # bigram model
+            WA = torch.log(self.A_counts + λ)
+            WA[:, self.bos_t] = -float('inf') 
+            WA[self.eos_t, :] = -float('inf') 
+            # normalize same as init
+            self.A = WA.softmax(dim=1) 
+
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
