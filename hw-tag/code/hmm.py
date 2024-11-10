@@ -388,37 +388,74 @@ class HiddenMarkovModel:
 
         self.alpha = [torch.full((self.k,), float('-inf')) for _ in isent]
         self.alpha[0] = torch.log(self.eye[self.bos_t])
+        print(f"\nInitial alpha[0]: {torch.exp(self.alpha[0])}")
 
-        # Forward pass - same approach as the viterbi algo w slight chnages 
-        for j in range(1, n +1):
-            word_id= isent[j][0]
+        # Keep track of scaling factors
+        log_scale = 0.0
+
+        # as we've done w the others, we handle first position specially
+        j = 1
+        word_id = isent[j][0]
+        print(f"\nPosition {j}, word {word_id}")
+        print(f"A matrix:\n{self.A}")
+        print(f"B matrix:\n{self.B}")
             
-            for t in valid_tags:  
-                for s in valid_tags: 
-                    if self.A[s,t] > 0 and self.B[t,word_id] > 0:
-                        term = (self.alpha[j-1][s] + 
-                            torch.log(self.A[s,t]) + 
-                            torch.log(self.B[t,word_id]))
-                        
-                        # adding in log space
-                        if self.alpha[j][t] == float('-inf'):
-                            self.alpha[j][t] = term
-                        else:
-                            self.alpha[j][t] = torch.logsumexp(
-                                torch.tensor([self.alpha[j][t], term]), dim=0)
+        for t in valid_tags:
+            total_prob = float('-inf') 
+
+            s = self.bos_t
+            if self.A[s,t] > 0 and self.B[t,word_id] > 0:
+                term = (self.alpha[j-1][s] + 
+                    torch.log(self.A[s,t]) + 
+                    torch.log(self.B[t,word_id]))
+                print(f"\nFor t={t}:")
+                print(f"prev_alpha={torch.exp(self.alpha[j-1][s])}")
+                print(f"trans_prob={self.A[s,t]}")
+                print(f"emit_prob={self.B[t,word_id]}")
+                print(f"term={torch.exp(term)}")
+                total_prob = term
+            self.alpha[j][t] = total_prob
+        print(f"Alpha[{j}] in log space: {self.alpha[j]}")
+        print(f"Alpha[{j}] in prob space: {torch.exp(self.alpha[j])}")
         
+        # implementing the scale trick in section C to prevent underflow
+        max_alpha = torch.max(self.alpha[j])
+        self.alpha[j] = self.alpha[j] - max_alpha
+        log_scale += max_alpha
+
+        # Rest of forward pass
+        for j in range(2, n + 1):
+            word_id = isent[j][0]
+            for t in valid_tags:
+                total_prob = float('-inf')
+                for s in valid_tags:
+                    term = (self.alpha[j-1][s] + 
+                        torch.log(self.A[s,t]) + 
+                        torch.log(self.B[t,word_id]))
+                    total_prob = torch.logsumexp(
+                                torch.tensor([total_prob, term]), dim=0)
+                self.alpha[j][t] = total_prob
+
+            # scaling trick again
+            max_alpha = torch.max(self.alpha[j])
+            self.alpha[j] = self.alpha[j] - max_alpha
+            log_scale += max_alpha
+
+        total_prob = float('-inf')
         # similar as well to Viterbis, handling the EOS transition
         for s in valid_tags:
-            if self.A[s,self.eos_t] > 0:
-                term = self.alpha[n][s] + torch.log(self.A[s,self.eos_t])
-                if self.alpha[n+1][self.eos_t] == float('-inf'):
-                    self.alpha[n+1][self.eos_t] = term
-                else:
-                    self.alpha[n+1][self.eos_t] = torch.logsumexp(
-                        torch.tensor([self.alpha[n+1][self.eos_t], term]), dim=0)
+            term = self.alpha[n][s] + torch.log(self.A[s,self.eos_t])
+            total_prob = torch.logsumexp(
+                        torch.tensor([total_prob, term]), dim=0)
+                    
+        self.alpha[n+1][self.eos_t] = total_prob
+        print(f"\nFinal alpha in prob space: {torch.exp(self.alpha[n+1])}")
     
-        # reps the probability of getting to EOS
-        self.log_Z = self.alpha[-1][self.eos_t]
+        # final unscaled log prob 
+        self.log_Z = self.alpha[n+1][self.eos_t] + log_scale
+        
+        print(f"log_Z: {self.log_Z}")
+        print(f"Z (prob): {torch.exp(self.log_Z)}")
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
