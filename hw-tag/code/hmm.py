@@ -123,15 +123,6 @@ class HiddenMarkovModel:
             # of letting us speed up to O(nk) in the unigram case.
             self.A = self.A.repeat(self.k, 1)   # copy the single row k times  
 
-        # Verify indices match expectations
-        assert self.tagset.index(Tag('C')) == 0
-        assert self.tagset.index(Tag('H')) == 1
-        assert self.eos_t == 2
-        assert self.bos_t == 3
-        assert self.vocab.index(Word('1')) == 0
-        assert self.vocab.index(Word('2')) == 1
-        assert self.vocab.index(Word('3')) == 2
-
     def printAB(self) -> None:
         """Print the A and B matrices in a more human-readable format (tab-separated)."""
         print("Transition matrix A:")
@@ -381,79 +372,48 @@ class HiddenMarkovModel:
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
         
-        # same as the first thing - the viterbi 
-        n = len(isent) - 2  # exclude BOS and EOS
-        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
-    
+        # Extract word IDs excluding BOS and EOS
+        word_ids = [word_id for word_id, _ in isent[1:-1]]  # exclude BOS and EOS
+        word_ids = torch.tensor(word_ids, dtype=torch.long)
+        T = len(word_ids) + 1  
 
-        self.alpha = [torch.full((self.k,), float('-inf')) for _ in isent]
-        self.alpha[0] = torch.log(self.eye[self.bos_t])
-        print(f"\nInitial alpha[0]: {torch.exp(self.alpha[0])}")
+        alpha = torch.full((T,self.k), float('-inf'))
+        
+        #valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
 
-        # Keep track of scaling factors
+        log_A = torch.log(self.A + 1e-10)
+        log_B = torch.log(self.B + 1e-10)
+
+        # initial alpha for BOS, log(1)
+        alpha[0, self.bos_t] = 0.0 
+
+        #scaling as in other functions
         log_scale = 0.0
 
-        # as we've done w the others, we handle first position specially
-        j = 1
-        word_id = isent[j][0]
-        print(f"\nPosition {j}, word {word_id}")
-        print(f"A matrix:\n{self.A}")
-        print(f"B matrix:\n{self.B}")
+        # Forward pass
+        for t in range(1, T):
+            word_id = word_ids[t -1 ]
+
+            # Compute alpha[t] for all states
+            temp = alpha[t - 1].unsqueeze(1) + log_A  # Shape: [k_prev, k_curr]
+
+            temp[:, self.bos_t] = float('-inf')
             
-        for t in valid_tags:
-            total_prob = float('-inf') 
+            # log-sum-exp over previous states 
+            alpha_t = torch.logsumexp(temp, dim=0) + log_B[:, word_id]
 
-            s = self.bos_t
-            if self.A[s,t] > 0 and self.B[t,word_id] > 0:
-                term = (self.alpha[j-1][s] + 
-                    torch.log(self.A[s,t]) + 
-                    torch.log(self.B[t,word_id]))
-                print(f"\nFor t={t}:")
-                print(f"prev_alpha={torch.exp(self.alpha[j-1][s])}")
-                print(f"trans_prob={self.A[s,t]}")
-                print(f"emit_prob={self.B[t,word_id]}")
-                print(f"term={torch.exp(term)}")
-                total_prob = term
-            self.alpha[j][t] = total_prob
-        print(f"Alpha[{j}] in log space: {self.alpha[j]}")
-        print(f"Alpha[{j}] in prob space: {torch.exp(self.alpha[j])}")
-        
-        # implementing the scale trick in section C to prevent underflow
-        max_alpha = torch.max(self.alpha[j])
-        self.alpha[j] = self.alpha[j] - max_alpha
-        log_scale += max_alpha
-
-        # Rest of forward pass
-        for j in range(2, n + 1):
-            word_id = isent[j][0]
-            for t in valid_tags:
-                total_prob = float('-inf')
-                for s in valid_tags:
-                    term = (self.alpha[j-1][s] + 
-                        torch.log(self.A[s,t]) + 
-                        torch.log(self.B[t,word_id]))
-                    total_prob = torch.logsumexp(
-                                torch.tensor([total_prob, term]), dim=0)
-                self.alpha[j][t] = total_prob
-
-            # scaling trick again
-            max_alpha = torch.max(self.alpha[j])
-            self.alpha[j] = self.alpha[j] - max_alpha
+            # scaling to prevent underflow
+            max_alpha = torch.max(alpha_t)
+            alpha[t] = alpha_t - max_alpha
             log_scale += max_alpha
 
-        total_prob = float('-inf')
-        # similar as well to Viterbis, handling the EOS transition
-        for s in valid_tags:
-            term = self.alpha[n][s] + torch.log(self.A[s,self.eos_t])
-            total_prob = torch.logsumexp(
-                        torch.tensor([total_prob, term]), dim=0)
-                    
-        self.alpha[n+1][self.eos_t] = total_prob
-        print(f"\nFinal alpha in prob space: {torch.exp(self.alpha[n+1])}")
-    
-        # final unscaled log prob 
-        self.log_Z = self.alpha[n+1][self.eos_t] + log_scale
+        temp = alpha[T - 1] + log_A[:, self.eos_t]  
+        #  log probability (log Z) is alpha at EOS position plus scaling
+        self.log_Z = torch.logsumexp(temp, dim=0) + log_scale
         
+        #  alpha for backward pass
+        self.alpha = alpha
+
         print(f"log_Z: {self.log_Z}")
         print(f"Z (prob): {torch.exp(self.log_Z)}")
 
@@ -474,11 +434,83 @@ class HiddenMarkovModel:
         values and log Z, which were stored for us (in self) by the forward
         pass."""
 
-        # Pre-allocate beta just as we pre-allocated alpha.
-        beta = [torch.empty(self.k) for _ in isent]
-        beta[-1] = self.eye[self.eos_t]  # vector that is one-hot at EOS_TAG
-       
-        raise NotImplementedError   # you fill this in!
+        # same as previous 
+        n = len(isent) - 2  
+        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
+    
+        # Pre-allocate beta just as we pre-allocated alpha. in log space
+        self.beta = [torch.full((self.k,), float('-inf')) for _ in isent]
+        self.beta[-1][self.eos_t] = 0.0  # log(1) = 0 for EOS
+
+        # (like in forward pass)
+        log_scale = 0.0
+
+        # Backward pass
+        for j in range(n + 1, 0, -1):
+            word_id = isent[j][0]
+            
+            # For each previous tag
+            for s in valid_tags:
+                total_prob = float('-inf')
+                
+                # Sum over current tags
+                for t in valid_tags:
+                    if j == n + 1:  # special handling of EOS position
+                        if t == self.eos_t and self.A[s,t] > 0:
+                            p = torch.log(self.A[s,t])
+                            total_prob = torch.logsumexp(
+                                torch.tensor([total_prob, p + self.beta[j][t]]), dim=0)
+                    else:
+                        if self.A[s,t] > 0 and self.B[t,word_id] > 0:
+                            p = torch.log(self.A[s,t]) + torch.log(self.B[t,word_id])
+                            total_prob = torch.logsumexp(
+                                torch.tensor([total_prob, p + self.beta[j][t]]), dim=0)
+                
+                self.beta[j-1][s] = total_prob
+
+            # (similar to forward pass) scaling step 
+            if j > 1:  # don't scale BOS position
+                max_beta = torch.max(self.beta[j-1])
+                self.beta[j-1] = self.beta[j-1] - max_beta
+                log_scale += max_beta
+
+            # accum expected counts
+            if j < n + 1:  # skip EOS position for emissions
+                for t in valid_tags:
+                    if word_id < self.V:  # only count regular words
+                        posterior = torch.exp(
+                            self.alpha[j][t] + self.beta[j][t] - self.log_Z
+                        )
+                        self.B_counts[t,word_id] += mult * posterior
+                    
+                    # for the expected count of transitions
+                    for s in valid_tags:
+                        if self.A[s,t] > 0 and self.B[t,word_id] > 0:
+                            trans_prob = torch.exp(
+                                self.alpha[j-1][s] + 
+                                torch.log(self.A[s,t]) + 
+                                torch.log(self.B[t,word_id]) + 
+                                self.beta[j][t] - 
+                                self.log_Z
+                            )
+                            self.A_counts[s,t] += mult * trans_prob
+        
+        # same as previous fucntions, we handle BOS intitial transitions diff
+        for t in valid_tags:
+            if self.A[self.bos_t,t] > 0 and self.B[t,isent[1][0]] > 0:
+                trans_prob = torch.exp(
+                    self.alpha[0][self.bos_t] + 
+                    torch.log(self.A[self.bos_t,t]) + 
+                    torch.log(self.B[t,isent[1][0]]) + 
+                    self.beta[1][t] - 
+                    self.log_Z
+                )
+                self.A_counts[self.bos_t,t] += mult * trans_prob
+        
+        # this computation should match forward pass- we check this later 
+        log_Z_backward = self.beta[0][self.bos_t] + log_scale
+
+
 
         return log_Z_backward
 
