@@ -190,11 +190,11 @@ class HiddenMarkovModel:
             self.A[:, self.bos_t] = 0  # no transitions to BOS
             self.A[self.eos_t, :] = 0  # no transitions from EOS
 
-        # Debug: Print matrices after update
-        print("\nExpected counts A:")
-        print(self.A_counts)
-        print("\nExpected counts B:")
-        print(self.B_counts)
+        # debugging: print matrices after update
+        #print("\nExpected counts A:")
+        #print(self.A_counts)
+        #print("\nExpected counts B:")
+        #print(self.B_counts)
 
         # debugging :  probabilities sum to 1 where they should
         A_row_sums = self.A[:self.eos_t].sum(dim=1)
@@ -216,7 +216,7 @@ class HiddenMarkovModel:
               λ: float = 0,
               tolerance: float = 0.001,
               max_steps: int = 50000,
-              save_path: Optional[Path] = Path("my_hmm.pkl")) -> None:
+              save_path: Optional[Path|str] = "my_hmm.pkl") -> None:
         """Train the HMM on the given training corpus, starting at the current parameters.
         We will stop when the relative improvement of the development loss,
         since the last epoch, is less than the tolerance.  In particular,
@@ -227,53 +227,54 @@ class HiddenMarkovModel:
         if λ < 0:
             raise ValueError(f"{λ=} but should be >= 0")
         elif λ == 0:
-            λ = 1e-20  # Tiny smoothing to avoid 0/0
+            λ = 1e-20
+            # Smooth the counts by a tiny amount to avoid a problem where the M
+            # step gets transition probabilities p(t | s) = 0/0 = nan for
+            # context tags s that never occur at all, in particular s = EOS.
+            # 
+            # These 0/0 probabilities are never needed since those contexts
+            # never occur.  So their value doesn't really matter ... except that
+            # we do have to keep their value from being nan.  They show up in
+            # the matrix version of the forward algorithm, where they are
+            # multiplied by 0 and added into a sum.  A summand of 0 * nan would
+            # regrettably turn the entire sum into nan.      
+      
+        dev_loss = loss(self)   # evaluate the model at the start of training
         
-        print("\nInitial parameters:")
-        self.printAB()
-        
-        dev_loss = loss(self)
-        print(f"Initial loss: {dev_loss}")
-        
-        old_dev_loss: float = dev_loss
-        step: int = 0
-        
-        while step < max_steps:
-            print(f"\n=== Iteration {step+1} ===")
+        old_dev_loss: float = dev_loss     # loss from the last epoch
+        steps: int = 0   # total number of sentences the model has been trained on so far      
+        while steps < max_steps:
             
-            # E-step
-            print("\nRunning E-step...")
+            # E step: Run forward-backward on each sentence, and accumulate the
+            # expected counts into self.A_counts, self.B_counts.
+            #
+            # Note: If you were using a GPU, you could get a speedup by running
+            # forward-backward on several sentences in parallel.  This would
+            # require writing the algorithm using higher-dimensional tensor
+            # operations, allowing PyTorch to take advantage of hardware
+            # parallelism.  For example, you'd update alpha[j-1] to alpha[j] for
+            # all the sentences in the minibatch at once (with appropriate
+            # handling for short sentences of length < j-1).  
+
             self._zero_counts()
             for sentence in tqdm(corpus, total=len(corpus), leave=True):
                 isent = self._integerize_sentence(sentence, corpus)
-                print(f"\nProcessing sentence: {sentence}")
                 self.E_step(isent)
-                
-            # M-step
-            print("\nRunning M-step...")
+                steps += 1
+
+            # M step: Update the parameters based on the accumulated counts.
             self.M_step(λ)
+            if save_path: self.save(save_path)  # save incompletely trained model in case we crash
             
-            # Print updated parameters
-            print("\nUpdated parameters after iteration:")
-            self.printAB()
-            
-            # Evaluate
-            dev_loss = loss(self)
-            improvement = (old_dev_loss - dev_loss) / abs(old_dev_loss)
-            print(f"\nLoss: {dev_loss:.4f} (relative improvement: {improvement:.4%})")
-            
+            # Evaluate with the new parameters
+            dev_loss = loss(self)   # this will print its own log messages
             if dev_loss >= old_dev_loss * (1-tolerance):
-                print("\nConverged! Stopping training.")
+                # we haven't gotten much better, so perform early stopping
                 break
-                
-            old_dev_loss = dev_loss
-            step += 1
+            old_dev_loss = dev_loss            # remember for next eval batch
         
-        print("\nFinal parameters:")
-        self.printAB()
-        
-        if save_path: 
-            self.save(save_path)
+        # Save the trained model.
+        if save_path: self.save(save_path)
   
     def _integerize_sentence(self, sentence: Sentence, corpus: TaggedCorpus) -> IntegerizedSentence:
         """Integerize the words and tags of the given sentence, which came from the given corpus."""
@@ -319,11 +320,11 @@ class HiddenMarkovModel:
         self.forward_pass(isent)
 
         # we run backward for beta and expected counts w the updated values :)
-        log_Z_backward = self.backward_pass(isent, mult)
+        self.backward_pass(isent, mult)
 
         # check that the two values are close 
-        if not torch.isclose(self.log_Z, log_Z_backward, atol=1e-5):
-            print(f"Warning: log_Z from forward pass ({self.log_Z.item()}) and backward pass ({log_Z_backward.item()}) do not match.")
+        #if not torch.isclose(self.log_Z, log_Z_backward, atol=1e-5):
+            #print(f"Warning: log_Z from forward pass ({self.log_Z.item()}) and backward pass ({log_Z_backward.item()}) do not match.")
 
         # no need to return anything everything is in the model 
 
@@ -413,48 +414,40 @@ class HiddenMarkovModel:
         # directly to each alpha[j] in turn.
         
         # extract word IDs excluding BOS and EOS
-        word_ids = [word_id for word_id, _ in isent[1:-1]]  # exclude BOS and EOS
-        word_ids = torch.tensor(word_ids, dtype=torch.long)
+        word_ids = torch.tensor([w for w, _ in isent[1:-1]], dtype=torch.long)  # exclude BOS and EOS
         T = len(word_ids) + 1  
 
         alpha = torch.full((T,self.k), float('-inf'))
+        # initial alpha for BOS, log(1)
+        alpha[0, self.bos_t] = 0.0 
         
         #valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
 
         log_A = torch.log(self.A + 1e-10)
         log_B = torch.log(self.B + 1e-10)
 
-        # initial alpha for BOS, log(1)
-        alpha[0, self.bos_t] = 0.0 
-
         #scaling as in other functions
-        scaling_factors  = []
+        #scaling_factors  = []
 
         # Forward pass
         for t in range(1, T):
-            word_id = word_ids[t -1 ]
-
+        
             # Compute alpha[t] for all states
-            temp = alpha[t - 1].unsqueeze(1) + log_A  # Shape: [k_prev, k_curr]
-
-            temp[:, self.bos_t] = float('-inf')
-            
-            # log-sum-exp over previous states 
-            alpha[t] = torch.logsumexp(temp, dim=0) + log_B[:, word_id]
+            alpha_t = torch.logsumexp(alpha[t-1].unsqueeze(1) + log_A, dim=0)
+            alpha_t[self.bos_t] = float('-inf')
+            alpha[t] = alpha_t + log_B[:, word_ids[t-1]]
 
             # scaling to prevent underflow
             #max_alpha = torch.max(alpha_t)
             #alpha[t] = alpha_t - max_alpha
             #scaling_factors.append(max_alpha)
 
-        temp = alpha[T - 1] + log_A[:, self.eos_t]  
         #  log probability (log Z) is alpha at EOS position plus scaling
-        self.log_Z = torch.logsumexp(temp, dim=0)
-        
+        self.log_Z = torch.logsumexp(alpha[T-1] + log_A[:, self.eos_t], dim=0)
+
         #  alpha for backward pass
         self.alpha = alpha
         #self.scaling_factors = scaling_factors
-
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
