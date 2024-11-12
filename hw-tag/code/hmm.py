@@ -329,10 +329,15 @@ class HiddenMarkovModel:
         # no need to return anything everything is in the model 
 
         #for count accum 
-        word_ids = [word_id for word_id, _ in isent]
-        tag_ids = [tag_id for _, tag_id in isent]
-        T = len(word_ids) - 2 
-        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
+        word_ids = torch.tensor([w for w, _ in isent], dtype=torch.long)
+        tag_ids = torch.tensor([t if t is not None else -1 for _, t in isent], dtype=torch.long)
+        T = len(word_ids) - 2
+
+       # Create mask for valid tags once
+        valid_mask = torch.ones(self.k, dtype=torch.bool)
+        valid_mask[self.bos_t] = False
+        valid_mask[self.eos_t] = False
+        valid_indices = torch.where(valid_mask)[0]
 
         log_A = torch.log(self.A + 1e-10)
         log_B = torch.log(self.B + 1e-10)
@@ -342,58 +347,56 @@ class HiddenMarkovModel:
             tag_id = tag_ids[j]
 
             # all of these have two cases, for supervised and for unsupervised 
-            if tag_id is not None:  # supervised 
+            if tag_id != -1:  # supervised 
                 self.B_counts[tag_id, word_id] += mult
-                if j < T and tag_ids[j+1] is not None:
+                if j < T and tag_ids[j+1] != -1:
                     self.A_counts[tag_id, tag_ids[j+1]] += mult
             else:  # unsupervised 
                 # emission probabilities
-                for t in valid_tags:
-                    log_posterior = self.alpha[j, t] + self.beta[j, t] - self.log_Z
-                    posterior = torch.exp(log_posterior)
-                    self.B_counts[t, word_id] += mult * posterior
+                log_posterior = self.alpha[j, valid_indices] + self.beta[j, valid_indices] - self.log_Z
+                posterior = torch.exp(log_posterior)
+                self.B_counts[valid_indices, word_id] += mult * posterior
 
                 # transition probabilities
                 if j < T:
                     next_word = word_ids[j + 1]
-                    if tag_ids[j+1] is not None: 
-                        next_t = tag_ids[j+1]
-                        for s in valid_tags:
-                            log_posterior = (self.alpha[j, s] + 
-                                        log_A[s, next_t] + 
-                                        log_B[next_t, next_word] + 
-                                        self.beta[j + 1, next_t] - 
+                    next_tag = tag_ids[j+1]
+
+                    if next_tag != -1:
+                        log_posterior = (self.alpha[j, valid_indices] +
+                                        log_A[valid_indices, next_tag] +
+                                        log_B[next_tag, next_word] +
+                                        self.beta[j + 1, next_tag] -
                                         self.log_Z)
-                            posterior = torch.exp(log_posterior)
-                            self.A_counts[s, next_t] += mult * posterior
+                        posterior = torch.exp(log_posterior)
+                        self.A_counts[valid_indices, next_tag] += mult * posterior
                     else:  
-                        for s in valid_tags:
-                            for t in valid_tags:
-                                log_posterior = (self.alpha[j, s] + 
-                                            log_A[s, t] + 
-                                            log_B[t, next_word] + 
-                                            self.beta[j + 1, t] - 
-                                            self.log_Z)
-                                posterior = torch.exp(log_posterior)
-                                self.A_counts[s, t] += mult * posterior
+                        log_posterior = (self.alpha[j, valid_indices].unsqueeze(1) +  # [V] -> [V, 1]
+                                    log_A[valid_indices][:, valid_indices] +  # [V, V]
+                                    log_B[valid_indices, next_word].unsqueeze(0) +  # [1, V]
+                                    self.beta[j + 1, valid_indices].unsqueeze(0) -  # [1, V]
+                                    self.log_Z)  # scalar
+                        posterior = torch.exp(log_posterior)
+                        self.A_counts[valid_indices.unsqueeze(1), valid_indices.unsqueeze(0)] += mult * posterior
 
         # BOS transitions
-        if tag_ids[1] is not None: 
+        if tag_ids[1] != -1: 
             self.A_counts[self.bos_t, tag_ids[1]] += mult
-        else:  
-            for t in valid_tags:
-                log_posterior = log_A[self.bos_t, t] + log_B[t, word_ids[1]] + self.beta[1, t] - self.log_Z
-                posterior = torch.exp(log_posterior)
-                self.A_counts[self.bos_t, t] += mult * posterior
+        else:
+            log_posterior = (log_A[self.bos_t, valid_indices] +
+                            log_B[valid_indices, word_ids[1]] +
+                            self.beta[1, valid_indices] -
+                            self.log_Z)
+            posterior = torch.exp(log_posterior)
+            self.A_counts[self.bos_t, valid_indices] += mult * posterior
 
         # EOS transitions
-        if tag_ids[T] is not None:  
+        if tag_ids[T] != -1:  
             self.A_counts[tag_ids[T], self.eos_t] += mult
-        else:  
-            for s in valid_tags:
-                log_posterior = self.alpha[T, s] + log_A[s, self.eos_t] - self.log_Z
-                posterior = torch.exp(log_posterior)
-                self.A_counts[s, self.eos_t] += mult * posterior
+        else:
+            log_posterior = self.alpha[T, valid_indices] + log_A[valid_indices, self.eos_t] - self.log_Z
+            posterior = torch.exp(log_posterior)
+            self.A_counts[valid_indices, self.eos_t] += mult * posterior
 
         
     @typechecked
@@ -459,42 +462,45 @@ class HiddenMarkovModel:
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
         """
         We wanted this to work for supervised, semi-supervised, and unsupervised data."""
-        word_ids = [word_id for word_id, _ in isent]
+        word_ids = torch.tensor([w for w, _ in isent], dtype=torch.long)
         T = len(word_ids) - 2  # exclude BOS and EOS
-        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
-
-        beta = torch.full((T + 2, self.k), float('-inf'))
-        beta[-1, self.eos_t] = 0.0 
+ 
 
         # pre comp these for faster alg 
         log_A = torch.log(self.A + 1e-10)
         log_B = torch.log(self.B + 1e-10)
 
+        beta = torch.full((T + 2, self.k), float('-inf'))
+        beta[-1, self.eos_t] = 0.0
+
+        # Create mask for valid tags
+        valid_mask = torch.ones(self.k, dtype=torch.bool)
+        valid_mask[self.bos_t] = False
+        valid_mask[self.eos_t] = False
+        valid_indices = torch.where(valid_mask)[0]
+        
+        # Handle T position first (transitions to EOS)
+        beta[T, valid_indices] = log_A[valid_indices, self.eos_t]
         
         # backward pass with scaling
         for j in range(T, -1, -1):
-            for t_j in valid_tags:
-                if j == T:  
-                    beta[j, t_j] = log_A[t_j, self.eos_t]
-                else:
-                    next_word = word_ids[j + 1]
-                    scores = []
-                    for t_next in valid_tags:
-                        score = (log_A[t_j, t_next] + 
-                            log_B[t_next, next_word] + 
-                            beta[j + 1, t_next])
-                        scores.append(score)
-                    if scores:
-                        beta[j, t_j] = torch.logsumexp(torch.stack(scores), dim=0)
+            next_word = word_ids[j+1]
 
-            # same scaling as forward pass but reversed
+            if j == T:
+                beta[j, valid_indices] = log_A[valid_indices, self.eos_t]
+            else:
+                trans_scores = (log_A[valid_indices][:, valid_indices] + 
+                            log_B[valid_indices, next_word].unsqueeze(0) + 
+                            beta[j + 1, valid_indices].unsqueeze(0))
+                
+                beta[j, valid_indices] = torch.logsumexp(trans_scores, dim=1)
+
             #if j < T :  # don't scale at position 0
                #beta[j] = beta[j] - self.scaling_factors[j]
             
         self.beta = beta 
-        log_Z_backward = torch.logsumexp(beta[0], dim=0)
 
-        return log_Z_backward
+        return torch.logsumexp(beta[0], dim=0)
 
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
