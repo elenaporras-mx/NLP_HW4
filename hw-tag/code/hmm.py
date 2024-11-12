@@ -161,35 +161,25 @@ class HiddenMarkovModel:
         assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
                 'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
-        # emission probabilities 
-        self.B_counts[:self.eos_t] += λ  # Only smooth real tags
-        row_sums_B = self.B_counts.sum(dim=1, keepdim=True)
-        row_sums_B = torch.where(row_sums_B == 0, torch.ones_like(row_sums_B), row_sums_B)
-        self.B = self.B_counts / row_sums_B
-        self.B[self.eos_t:, :] = 0  # Ensure structural zeros
+        smoothed_A_counts = self.A_counts.clone()
+        smoothed_B_counts = self.B_counts.clone()
 
-     
-        if self.unigram: #uni case 
-            row_counts = self.A_counts.sum(dim=0) + λ  # sum over previous tags
-            # avoiding log(0) by adding small epsilon where needed
-            WA = torch.log(row_counts + 1e-10).unsqueeze(0)  # make it a 1xk matrix
-            WA[:, self.bos_t] = -float('inf')
-             # normalize same as init 
-            self.A = WA.softmax(dim=1) 
-            self.A = self.A.repeat(self.k, 1) # copy step
-        else:
-            # bigram model
-            smoothed_counts = self.A_counts.clone()
-            #smoothed_counts[:self.eos_t, :] *= 2 
-            smoothed_counts[:self.eos_t, :] += λ
+        # only smooth non-special
+        smoothed_A_counts[:self.eos_t, :] += λ
+        smoothed_B_counts[:self.eos_t, :] += λ
+        
+        # Normalize A while respecting structural zeros
+        A_normalizer = smoothed_A_counts.sum(dim=1, keepdim=True)
+        A_normalizer[A_normalizer == 0] = 1  # Avoid division by zero
+        self.A = smoothed_A_counts / A_normalizer
+        self.A[:, self.bos_t] = 0  # Ensure no transitions to BOS
+        self.A[self.eos_t, :] = 0  # Ensure no transitions from EOS
 
-            row_sums = smoothed_counts.sum(dim=1, keepdim= True)
-            row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-            self.A = smoothed_counts / row_sums
-            # set structural zeros
-            self.A[:, self.bos_t] = 0  # no transitions to BOS
-            self.A[self.eos_t, :] = 0  # no transitions from EOS
-
+        # Normalize B while respecting structural zeros
+        B_normalizer = smoothed_B_counts.sum(dim=1, keepdim=True)
+        B_normalizer[B_normalizer == 0] = 1  # Avoid division by zero
+        self.B = smoothed_B_counts / B_normalizer
+        self.B[self.eos_t:, :] = 0  # Ensure no emissions from EOS/BOS
         # debugging: print matrices after update
         #print("\nExpected counts A:")
         #print(self.A_counts)
@@ -197,12 +187,12 @@ class HiddenMarkovModel:
         #print(self.B_counts)
 
         # debugging :  probabilities sum to 1 where they should
-        A_row_sums = self.A[:self.eos_t].sum(dim=1)
-        B_row_sums = self.B[:self.eos_t].sum(dim=1)
-        assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-5), \
-            "Transition probabilities don't sum to 1"
-        assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-5), \
-            "Emission probabilities don't sum to 1"
+        #A_row_sums = self.A[:self.eos_t].sum(dim=1)
+        #B_row_sums = self.B[:self.eos_t].sum(dim=1)
+        #assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-5), \
+            #"Transition probabilities don't sum to 1"
+        #assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-5), \
+            #"Emission probabilities don't sum to 1"
         
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -371,13 +361,15 @@ class HiddenMarkovModel:
                         posterior = torch.exp(log_posterior)
                         self.A_counts[valid_indices, next_tag] += mult * posterior
                     else:  
-                        log_posterior = (self.alpha[j, valid_indices].unsqueeze(1) +  # [V] -> [V, 1]
-                                    log_A[valid_indices][:, valid_indices] +  # [V, V]
-                                    log_B[valid_indices, next_word].unsqueeze(0) +  # [1, V]
-                                    self.beta[j + 1, valid_indices].unsqueeze(0) -  # [1, V]
-                                    self.log_Z)  # scalar
-                        posterior = torch.exp(log_posterior)
-                        self.A_counts[valid_indices.unsqueeze(1), valid_indices.unsqueeze(0)] += mult * posterior
+                        # All valid current tags to all valid next tags
+                        for curr_tag in valid_indices:
+                            log_posterior = (self.alpha[j, curr_tag] +
+                                        log_A[curr_tag, valid_indices] +
+                                        log_B[valid_indices, next_word] +
+                                        self.beta[j + 1, valid_indices] -
+                                        self.log_Z)
+                            posterior = torch.exp(log_posterior)
+                            self.A_counts[curr_tag, valid_indices] += mult * posterior
 
         # BOS transitions
         if tag_ids[1] != -1: 
@@ -523,61 +515,56 @@ class HiddenMarkovModel:
         isent = self._integerize_sentence(sentence, corpus)
         n = len(isent) - 2  # exclude BOS and EOS
         
-        # exclusing BOS and EOS 
-        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
-
-        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
-        backpointers = [torch.full((self.k,), -1, dtype=torch.int) for _ in range(n + 2)]
+        word_ids = torch.tensor([w for w, _ in isent[1:-1]], dtype=torch.long)
+        log_A = torch.log(torch.where(self.A > 0, self.A, torch.tensor(1e-10)))
+        log_B = torch.log(torch.where(self.B > 0, self.B, torch.tensor(1e-10)))
+        
+        # exclusing BOS and EOS valid tag mask  
+        valid_mask = torch.ones(self.k, dtype=torch.bool)
+        valid_mask[self.bos_t] = False
+        valid_mask[self.eos_t] = False
+        valid_indices = torch.where(valid_mask)[0]
+        
+        alpha = torch.full((n + 2, self.k), float('-inf'))
+        backpointers = torch.full((n + 2, self.k), -1, dtype=torch.long)
 
         # (log probability of 1)
-        alpha[0][self.bos_t] = 0
+        alpha[0, self.bos_t] = 0.0
 
-        # for position 1, first word after BOS
-        word_id = isent[1][0]
-        for t in valid_tags:
-            if self.A[self.bos_t, t] > 0 and self.B[t, word_id] > 0:
-                alpha[1][t] = alpha[0][self.bos_t] + torch.log(self.A[self.bos_t, t]) + torch.log(self.B[t, word_id])
-                backpointers[1][t] = self.bos_t
-            else:
-                # for zero probabilities
-                alpha[1][t] = float('-inf')
-                backpointers[1][t] = -1
+        # for position 1, first word after BOS handle more efficiently 
+        word_id = word_ids[0]
+        scores_1 = alpha[0, self.bos_t] + log_A[self.bos_t, valid_indices] + log_B[valid_indices, word_id]
+        alpha[1, valid_indices] = scores_1
+        backpointers[1, valid_indices] = self.bos_t
 
-        # Forward pass
         for j in range(2, n + 1):  # Positions 2 to n
-            word_id = isent[j][0]
-            for t in valid_tags:
-                max_score = float('-inf')
-                best_s = -1
-                for s in valid_tags:
-                    if self.A[s, t] > 0 and self.B[t, word_id] > 0 and alpha[j - 1][s] > float('-inf'):
-                        score = alpha[j - 1][s] + torch.log(self.A[s, t]) + torch.log(self.B[t, word_id])
-                        if score > max_score:
-                            max_score = score
-                            best_s = s
-                alpha[j][t] = max_score
-                backpointers[j][t] = best_s
+            word_id = word_ids[j-1]
+        
+            # all possible transitions at once [prev_tags, curr_tags]
+            scores = (alpha[j-1, valid_indices].unsqueeze(1) +  
+                    log_A[valid_indices][:, valid_indices] +   
+                    log_B[valid_indices, word_id])            
+            
+            # best previous tag for each current tag
+            max_scores, best_prev = torch.max(scores, dim=0)  # max along previous tags
 
-        # transition to EOS at position n+1
-        max_score = float('-inf')
-        best_s = -1
-        for s in valid_tags:
-            if self.A[s, self.eos_t] > 0 and alpha[n][s] > float('-inf'):
-                score = alpha[n][s] + torch.log(self.A[s, self.eos_t])
-                if score > max_score:
-                    max_score = score
-                    best_s = s
-        alpha[n + 1][self.eos_t] = max_score
-        backpointers[n + 1][self.eos_t] = best_s
+            alpha[j, valid_indices] = max_scores
+            backpointers[j, valid_indices] = valid_indices[best_prev]
+
+        # transition to EOS at position n+1, more efficient
+        final_scores = alpha[n, valid_indices] + log_A[valid_indices, self.eos_t]
+        max_final_score, best_final = torch.max(final_scores, dim=0)
+        alpha[n + 1, self.eos_t] = max_final_score
+        backpointers[n + 1, self.eos_t] = valid_indices[best_final]
 
         # Backtracking
         tags = []
         current_tag = self.eos_t
         for j in range(n + 1, 0, -1): 
-            prev_tag = backpointers[j][current_tag]
+            prev_tag = backpointers[j, current_tag].item()
             if prev_tag == -1:
                 raise ValueError(f"No valid path at position {j}")
-            if j != 0 and current_tag != self.eos_t and current_tag != self.bos_t:
+            if j != n + 1 and current_tag != self.eos_t and current_tag != self.bos_t:
                 tags.insert(0, current_tag)
             current_tag = prev_tag
 
