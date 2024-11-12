@@ -227,53 +227,53 @@ class HiddenMarkovModel:
         if λ < 0:
             raise ValueError(f"{λ=} but should be >= 0")
         elif λ == 0:
-            λ = 1e-20
-            # Smooth the counts by a tiny amount to avoid a problem where the M
-            # step gets transition probabilities p(t | s) = 0/0 = nan for
-            # context tags s that never occur at all, in particular s = EOS.
-            # 
-            # These 0/0 probabilities are never needed since those contexts
-            # never occur.  So their value doesn't really matter ... except that
-            # we do have to keep their value from being nan.  They show up in
-            # the matrix version of the forward algorithm, where they are
-            # multiplied by 0 and added into a sum.  A summand of 0 * nan would
-            # regrettably turn the entire sum into nan.      
-      
-        dev_loss = loss(self)   # evaluate the model at the start of training
+            λ = 1e-20  # Tiny smoothing to avoid 0/0
         
-        old_dev_loss: float = dev_loss     # loss from the last epoch
-        step: int = 0   # total number of sentences the model has been trained on so far      
+        print("\nInitial parameters:")
+        self.printAB()
+        
+        dev_loss = loss(self)
+        print(f"Initial loss: {dev_loss}")
+        
+        old_dev_loss: float = dev_loss
+        step: int = 0
+        
         while step < max_steps:
+            print(f"\n=== Iteration {step+1} ===")
             
-            # E step: Run forward-backward on each sentence, and accumulate the
-            # expected counts into self.A_counts, self.B_counts.
-            #
-            # Note: If you were using a GPU, you could get a speedup by running
-            # forward-backward on several sentences in parallel.  This would
-            # require writing the algorithm using higher-dimensional tensor
-            # operations, allowing PyTorch to take advantage of hardware
-            # parallelism.  For example, you'd update alpha[j-1] to alpha[j] for
-            # all the sentences in the minibatch at once (with appropriate
-            # handling for short sentences of length < j-1).  
-
+            # E-step
+            print("\nRunning E-step...")
             self._zero_counts()
             for sentence in tqdm(corpus, total=len(corpus), leave=True):
                 isent = self._integerize_sentence(sentence, corpus)
+                print(f"\nProcessing sentence: {sentence}")
                 self.E_step(isent)
-
-            # M step: Update the parameters based on the accumulated counts.
+                
+            # M-step
+            print("\nRunning M-step...")
             self.M_step(λ)
             
-            # Evaluate with the new parameters
-            dev_loss = loss(self)   # this will print its own log messages
+            # Print updated parameters
+            print("\nUpdated parameters after iteration:")
+            self.printAB()
+            
+            # Evaluate
+            dev_loss = loss(self)
+            improvement = (old_dev_loss - dev_loss) / abs(old_dev_loss)
+            print(f"\nLoss: {dev_loss:.4f} (relative improvement: {improvement:.4%})")
+            
             if dev_loss >= old_dev_loss * (1-tolerance):
-                # we haven't gotten much better, so perform early stopping
+                print("\nConverged! Stopping training.")
                 break
-            old_dev_loss = dev_loss            # remember for next eval batch
+                
+            old_dev_loss = dev_loss
+            step += 1
         
-        # For convenience when working in a Python notebook, 
-        # we automatically save our training work by default.
-        if save_path: self.save(save_path)
+        print("\nFinal parameters:")
+        self.printAB()
+        
+        if save_path: 
+            self.save(save_path)
   
     def _integerize_sentence(self, sentence: Sentence, corpus: TaggedCorpus) -> IntegerizedSentence:
         """Integerize the words and tags of the given sentence, which came from the given corpus."""
@@ -327,7 +327,72 @@ class HiddenMarkovModel:
 
         # no need to return anything everything is in the model 
 
+        #for count accum 
+        word_ids = [word_id for word_id, _ in isent]
+        tag_ids = [tag_id for _, tag_id in isent]
+        T = len(word_ids) - 2 
+        valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
 
+        log_A = torch.log(self.A + 1e-10)
+        log_B = torch.log(self.B + 1e-10)
+
+        for j in range(1, T + 1):  # skip BOS position
+            word_id = word_ids[j]
+            tag_id = tag_ids[j]
+
+            # all of these have two cases, for supervised and for unsupervised 
+            if tag_id is not None:  # supervised 
+                self.B_counts[tag_id, word_id] += mult
+                if j < T and tag_ids[j+1] is not None:
+                    self.A_counts[tag_id, tag_ids[j+1]] += mult
+            else:  # unsupervised 
+                # emission probabilities
+                for t in valid_tags:
+                    log_posterior = self.alpha[j, t] + self.beta[j, t] - self.log_Z
+                    posterior = torch.exp(log_posterior)
+                    self.B_counts[t, word_id] += mult * posterior
+
+                # transition probabilities
+                if j < T:
+                    next_word = word_ids[j + 1]
+                    if tag_ids[j+1] is not None: 
+                        next_t = tag_ids[j+1]
+                        for s in valid_tags:
+                            log_posterior = (self.alpha[j, s] + 
+                                        log_A[s, next_t] + 
+                                        log_B[next_t, next_word] + 
+                                        self.beta[j + 1, next_t] - 
+                                        self.log_Z)
+                            posterior = torch.exp(log_posterior)
+                            self.A_counts[s, next_t] += mult * posterior
+                    else:  
+                        for s in valid_tags:
+                            for t in valid_tags:
+                                log_posterior = (self.alpha[j, s] + 
+                                            log_A[s, t] + 
+                                            log_B[t, next_word] + 
+                                            self.beta[j + 1, t] - 
+                                            self.log_Z)
+                                posterior = torch.exp(log_posterior)
+                                self.A_counts[s, t] += mult * posterior
+
+        # BOS transitions
+        if tag_ids[1] is not None: 
+            self.A_counts[self.bos_t, tag_ids[1]] += mult
+        else:  
+            for t in valid_tags:
+                log_posterior = log_A[self.bos_t, t] + log_B[t, word_ids[1]] + self.beta[1, t] - self.log_Z
+                posterior = torch.exp(log_posterior)
+                self.A_counts[self.bos_t, t] += mult * posterior
+
+        # EOS transitions
+        if tag_ids[T] is not None:  
+            self.A_counts[tag_ids[T], self.eos_t] += mult
+        else:  
+            for s in valid_tags:
+                log_posterior = self.alpha[T, s] + log_A[s, self.eos_t] - self.log_Z
+                posterior = torch.exp(log_posterior)
+                self.A_counts[s, self.eos_t] += mult * posterior
 
         
     @typechecked
@@ -347,7 +412,7 @@ class HiddenMarkovModel:
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
         
-        # Extract word IDs excluding BOS and EOS
+        # extract word IDs excluding BOS and EOS
         word_ids = [word_id for word_id, _ in isent[1:-1]]  # exclude BOS and EOS
         word_ids = torch.tensor(word_ids, dtype=torch.long)
         T = len(word_ids) + 1  
@@ -375,20 +440,20 @@ class HiddenMarkovModel:
             temp[:, self.bos_t] = float('-inf')
             
             # log-sum-exp over previous states 
-            alpha_t = torch.logsumexp(temp, dim=0) + log_B[:, word_id]
+            alpha[t] = torch.logsumexp(temp, dim=0) + log_B[:, word_id]
 
             # scaling to prevent underflow
-            max_alpha = torch.max(alpha_t)
-            alpha[t] = alpha_t - max_alpha
-            scaling_factors.append(max_alpha)
+            #max_alpha = torch.max(alpha_t)
+            #alpha[t] = alpha_t - max_alpha
+            #scaling_factors.append(max_alpha)
 
         temp = alpha[T - 1] + log_A[:, self.eos_t]  
         #  log probability (log Z) is alpha at EOS position plus scaling
-        self.log_Z = torch.logsumexp(temp, dim=0) + sum(scaling_factors)
+        self.log_Z = torch.logsumexp(temp, dim=0)
         
         #  alpha for backward pass
         self.alpha = alpha
-        self.scaling_factors = scaling_factors
+        #self.scaling_factors = scaling_factors
 
 
             # Note: once you have this working on the ice cream data, you may
@@ -402,7 +467,6 @@ class HiddenMarkovModel:
         """
         We wanted this to work for supervised, semi-supervised, and unsupervised data."""
         word_ids = [word_id for word_id, _ in isent]
-        tag_ids = [tag_id for _, tag_id in isent]
         T = len(word_ids) - 2  # exclude BOS and EOS
         valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
 
@@ -430,71 +494,12 @@ class HiddenMarkovModel:
                     if scores:
                         beta[j, t_j] = torch.logsumexp(torch.stack(scores), dim=0)
 
-            # same scaling as forward pass with the reversed factors 
-            if j < T :  # don't scale at position 0
-               beta[j] = beta[j] - self.scaling_factors[j]
-
+            # same scaling as forward pass but reversed
+            #if j < T :  # don't scale at position 0
+               #beta[j] = beta[j] - self.scaling_factors[j]
+            
         self.beta = beta 
-        log_Z_backward = torch.logsumexp(beta[0], dim=0) + sum(self.scaling_factors)
-
-        # for count accumulation, this needs to move to E Step 
-        for j in range(1, T + 1):  # skip BOS position
-            word_id = word_ids[j]
-            tag_id = tag_ids[j]
-
-            # all of these have two cases, for supervised and for unsupervised 
-            if tag_id is not None:  # supervised 
-                self.B_counts[tag_id, word_id] += mult
-                if j < T and tag_ids[j+1] is not None:
-                    self.A_counts[tag_id, tag_ids[j+1]] += mult
-            else:  # unsupervised 
-                # emission probabilities - this is likely wrng, need to troubleshoot
-                for t in valid_tags:
-                    log_posterior = self.alpha[j, t] + beta[j, t] - self.log_Z
-                    posterior = torch.exp(log_posterior)
-                    self.B_counts[t, word_id] += mult * posterior
-
-                # transition probabilities - these are doing really well 
-                if j < T:
-                    next_word = word_ids[j + 1]
-                    if tag_ids[j+1] is not None: 
-                        next_t = tag_ids[j+1]
-                        for s in valid_tags:
-                            log_posterior = (self.alpha[j, s] + 
-                                        log_A[s, next_t] + 
-                                        log_B[next_t, next_word] + 
-                                        beta[j + 1, next_t] - 
-                                        self.log_Z)
-                            posterior = torch.exp(log_posterior)
-                            self.A_counts[s, next_t] += mult * posterior
-                    else:  
-                        for s in valid_tags:
-                            for t in valid_tags:
-                                log_posterior = (self.alpha[j, s] + 
-                                            log_A[s, t] + 
-                                            log_B[t, next_word] + 
-                                            beta[j + 1, t] - 
-                                            self.log_Z)
-                                posterior = torch.exp(log_posterior)
-                                self.A_counts[s, t] += mult * posterior
-
-        # BOS transitions
-        if tag_ids[1] is not None: 
-            self.A_counts[self.bos_t, tag_ids[1]] += mult
-        else:  
-            for t in valid_tags:
-                log_posterior = log_A[self.bos_t, t] + log_B[t, word_ids[1]] + beta[1, t] - self.log_Z
-                posterior = torch.exp(log_posterior)
-                self.A_counts[self.bos_t, t] += mult * posterior
-
-        #  EOS transitions
-        if tag_ids[T] is not None:  # Last tag is known
-            self.A_counts[tag_ids[T], self.eos_t] += mult
-        else:  
-            for s in valid_tags:
-                log_posterior = self.alpha[T, s] + log_A[s, self.eos_t] - self.log_Z
-                posterior = torch.exp(log_posterior)
-                self.A_counts[s, self.eos_t] += mult * posterior
+        log_Z_backward = torch.logsumexp(beta[0], dim=0)
 
         return log_Z_backward
 
