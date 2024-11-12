@@ -161,25 +161,43 @@ class HiddenMarkovModel:
         assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
                 'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
-        smoothed_A_counts = self.A_counts.clone()
-        smoothed_B_counts = self.B_counts.clone()
+        # emission probabilities (this part works well)
+        self.B_counts[:self.eos_t] += λ
+        row_sums_B = self.B_counts.sum(dim=1, keepdim=True)
+        row_sums_B = torch.where(row_sums_B == 0, torch.ones_like(row_sums_B), row_sums_B)
+        self.B = self.B_counts / row_sums_B
+        self.B[self.eos_t:, :] = 0
 
-        # only smooth non-special
-        smoothed_A_counts[:self.eos_t, :] += λ
-        smoothed_B_counts[:self.eos_t, :] += λ
-        
-        # Normalize A while respecting structural zeros
-        A_normalizer = smoothed_A_counts.sum(dim=1, keepdim=True)
-        A_normalizer[A_normalizer == 0] = 1  # Avoid division by zero
-        self.A = smoothed_A_counts / A_normalizer
-        self.A[:, self.bos_t] = 0  # Ensure no transitions to BOS
-        self.A[self.eos_t, :] = 0  # Ensure no transitions from EOS
+        # transition probabilitiesmaybe overkill for normalization
+        if self.unigram:
+            row_counts = self.A_counts.sum(dim=0) + λ
+            WA = torch.log(row_counts + 1e-10).unsqueeze(0)
+            WA[:, self.bos_t] = -float('inf')
+            self.A = WA.softmax(dim=1)
+            self.A = self.A.repeat(self.k, 1)
+        else:
+            # smoothed copy
+            smoothed_A = self.A_counts.clone()
+            smoothed_A[:self.eos_t, :] += λ
 
-        # Normalize B while respecting structural zeros
-        B_normalizer = smoothed_B_counts.sum(dim=1, keepdim=True)
-        B_normalizer[B_normalizer == 0] = 1  # Avoid division by zero
-        self.B = smoothed_B_counts / B_normalizer
-        self.B[self.eos_t:, :] = 0  # Ensure no emissions from EOS/BOS
+            # zero out structural zeros before normalization
+            smoothed_A[:, self.bos_t] = 0
+            smoothed_A[self.eos_t, :] = 0
+
+            row_sums = smoothed_A.sum(dim=1, keepdim=True)
+            # for zero rows
+            mask = (row_sums > 0).squeeze()
+
+            self.A = torch.zeros_like(smoothed_A)
+            
+            # normalize non-zero rows
+            self.A[mask] = smoothed_A[mask] / row_sums[mask]
+
+            # overkill (?) step 
+            row_sums = self.A.sum(dim=1, keepdim=True)
+            mask = (row_sums > 0).squeeze()
+            if mask.any():
+                self.A[mask] = self.A[mask] / row_sums[mask]
         # debugging: print matrices after update
         #print("\nExpected counts A:")
         #print(self.A_counts)
@@ -187,12 +205,12 @@ class HiddenMarkovModel:
         #print(self.B_counts)
 
         # debugging :  probabilities sum to 1 where they should
-        #A_row_sums = self.A[:self.eos_t].sum(dim=1)
-        #B_row_sums = self.B[:self.eos_t].sum(dim=1)
-        #assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-5), \
-            #"Transition probabilities don't sum to 1"
-        #assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-5), \
-            #"Emission probabilities don't sum to 1"
+        A_row_sums = self.A[:self.eos_t].sum(dim=1)
+        B_row_sums = self.B[:self.eos_t].sum(dim=1)
+        assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-3), \
+            "Transition probabilities don't sum to 1"
+        assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-3), \
+            "Emission probabilities don't sum to 1"
         
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -557,7 +575,7 @@ class HiddenMarkovModel:
         alpha[n + 1, self.eos_t] = max_final_score
         backpointers[n + 1, self.eos_t] = valid_indices[best_final]
 
-        # Backtracking
+        # backtracking
         tags = []
         current_tag = self.eos_t
         for j in range(n + 1, 0, -1): 
