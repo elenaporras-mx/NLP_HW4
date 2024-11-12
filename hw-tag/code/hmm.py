@@ -161,13 +161,11 @@ class HiddenMarkovModel:
         assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
                 'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
-        # emission probabilities with numerical safeguards
-        smoothed_B_counts = self.B_counts.clone()
-        # given but tweaked for safety : Update emission probabilities (self.B).
-        smoothed_B_counts[:self.eos_t, :] += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
-        row_sums_B = smoothed_B_counts.sum(dim=1, keepdim=True)
+        # emission probabilities 
+        self.B_counts[:self.eos_t] += λ  # Only smooth real tags
+        row_sums_B = self.B_counts.sum(dim=1, keepdim=True)
         row_sums_B = torch.where(row_sums_B == 0, torch.ones_like(row_sums_B), row_sums_B)
-        self.B = smoothed_B_counts / row_sums_B
+        self.B = self.B_counts / row_sums_B
         self.B[self.eos_t:, :] = 0  # Ensure structural zeros
 
      
@@ -182,7 +180,9 @@ class HiddenMarkovModel:
         else:
             # bigram model
             smoothed_counts = self.A_counts.clone()
+            #smoothed_counts[:self.eos_t, :] *= 2 
             smoothed_counts[:self.eos_t, :] += λ
+
             row_sums = smoothed_counts.sum(dim=1, keepdim= True)
             row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
             self.A = smoothed_counts / row_sums
@@ -190,10 +190,11 @@ class HiddenMarkovModel:
             self.A[:, self.bos_t] = 0  # no transitions to BOS
             self.A[self.eos_t, :] = 0  # no transitions from EOS
 
-        # Debug: Print final matrices
-        print("\nAfter M-step:")
-        print("A matrix:\n", self.A)
-        print("B matrix:\n", self.B)
+        # Debug: Print matrices after update
+        print("\nExpected counts A:")
+        print(self.A_counts)
+        print("\nExpected counts B:")
+        print(self.B_counts)
 
         # debugging :  probabilities sum to 1 where they should
         A_row_sums = self.A[:self.eos_t].sum(dim=1)
@@ -310,50 +311,24 @@ class HiddenMarkovModel:
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
         
-        #  guarding against potential issues 
-        if not isent:
-            raise ValueError("Empty sentence")
-        if mult <= 0:
-            raise ValueError("Multiplier must be positive")
-        if len(isent) < 3:  # Must have at least BOS, one word, EOS
-            raise ValueError("Sentence too short")
-        
-        # Initialize count matrices if they don't exist
-        if not hasattr(self, 'A_counts'):
-            self._zero_counts()
 
-        print("\nProcessing sentence:", isent)
+        #we run the forward pass for alpha and logZ
+        # originally this caused me some trouble bc i thought we would have to save something 
+        # here, but this is just an internal update !
 
-        # initial transition special case 
-        first_tag = isent[1][1]  # first real tag after BOS
-        if first_tag is not None:
-            if not 0 <= first_tag < self.k:
-                raise ValueError(f"Invalid tag index: {first_tag}")
-            self.A_counts[self.bos_t, first_tag] += mult
+        self.forward_pass(isent)
+
+        # we run backward for beta and expected counts w the updated values :)
+        log_Z_backward = self.backward_pass(isent, mult)
+
+        # check that the two values are close 
+        if not torch.isclose(self.log_Z, log_Z_backward, atol=1e-5):
+            print(f"Warning: log_Z from forward pass ({self.log_Z.item()}) and backward pass ({log_Z_backward.item()}) do not match.")
+
+        # no need to return anything everything is in the model 
 
 
-        # currently stuck here .. the indexes are weird and other strange errors
-        for j in range(1, len(isent)-1): # skip EOS And BOS
-            word_id, tag_id = isent[j]
-            _, prev_tag_id = isent[j-1] 
-            
-            if tag_id is not None:  # we have a tag
-                
-                if word_id < self.V: 
 
-                    self.B_counts[tag_id, word_id] += mult
-                
-                if prev_tag_id is not None:
-                    self.A_counts[prev_tag_id, tag_id] += mult
-        
-        last_tag =isent[-2][1] # tage bfore EOS
-        if last_tag is not None:
-            self.A_counts[last_tag, self.eos_t] += mult
-    
-        # Debug output: show accumulated counts
-        print("\nCurrent counts after this sentence:")
-        print("A_counts:\n", self.A_counts)
-        print("B_counts:\n", self.B_counts)
         
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
@@ -388,7 +363,7 @@ class HiddenMarkovModel:
         alpha[0, self.bos_t] = 0.0 
 
         #scaling as in other functions
-        log_scale = 0.0
+        scaling_factors  = []
 
         # Forward pass
         for t in range(1, T):
@@ -405,17 +380,16 @@ class HiddenMarkovModel:
             # scaling to prevent underflow
             max_alpha = torch.max(alpha_t)
             alpha[t] = alpha_t - max_alpha
-            log_scale += max_alpha
+            scaling_factors.append(max_alpha)
 
         temp = alpha[T - 1] + log_A[:, self.eos_t]  
         #  log probability (log Z) is alpha at EOS position plus scaling
-        self.log_Z = torch.logsumexp(temp, dim=0) + log_scale
+        self.log_Z = torch.logsumexp(temp, dim=0) + sum(scaling_factors)
         
         #  alpha for backward pass
         self.alpha = alpha
+        self.scaling_factors = scaling_factors
 
-        print(f"log_Z: {self.log_Z}")
-        print(f"Z (prob): {torch.exp(self.log_Z)}")
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
@@ -425,94 +399,104 @@ class HiddenMarkovModel:
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
-        """Run the backwards algorithm from the handout on a tagged, untagged, 
-        or partially tagged sentence.  Return log Z (the log of the backward
-        probability). 
-        
-        As a side effect, add the expected transition and emission counts (times
-        mult) into self.A_counts and self.B_counts.  These depend on the alpha
-        values and log Z, which were stored for us (in self) by the forward
-        pass."""
-
-        # same as previous 
-        n = len(isent) - 2  
+        """
+        We wanted this to work for supervised, semi-supervised, and unsupervised data."""
+        word_ids = [word_id for word_id, _ in isent]
+        tag_ids = [tag_id for _, tag_id in isent]
+        T = len(word_ids) - 2  # exclude BOS and EOS
         valid_tags = [t for t in range(self.k) if t != self.bos_t and t != self.eos_t]
-    
-        # Pre-allocate beta just as we pre-allocated alpha. in log space
-        self.beta = [torch.full((self.k,), float('-inf')) for _ in isent]
-        self.beta[-1][self.eos_t] = 0.0  # log(1) = 0 for EOS
 
-        # (like in forward pass)
-        log_scale = 0.0
+        beta = torch.full((T + 2, self.k), float('-inf'))
+        beta[-1, self.eos_t] = 0.0 
 
-        # Backward pass
-        for j in range(n + 1, 0, -1):
-            word_id = isent[j][0]
-            
-            # For each previous tag
+        # pre comp these for faster alg 
+        log_A = torch.log(self.A + 1e-10)
+        log_B = torch.log(self.B + 1e-10)
+
+        # backward pass with scaling
+        for j in range(T, -1, -1):
+            for t_j in valid_tags:
+                if j == T:  
+                    beta[j, t_j] = log_A[t_j, self.eos_t]
+                else:
+                    next_word = word_ids[j + 1]
+                    scores = []
+                    for t_next in valid_tags:
+                        score = (log_A[t_j, t_next] + 
+                            log_B[t_next, next_word] + 
+                            beta[j + 1, t_next])
+                        scores.append(score)
+                    if scores:
+                        beta[j, t_j] = torch.logsumexp(torch.stack(scores), dim=0)
+
+            # same scaling as forward pass with the reversed factors 
+            if j > 0:  # Don't scale at position 0
+               beta[j] = beta[j] - self.scaling_factors[j-1]
+
+        self.beta = beta 
+        log_Z_backward = torch.logsumexp(beta[0], dim=0) + sum(self.scaling_factors)
+
+        # for count accumulation, this needs to move to E Step 
+        for j in range(1, T + 1):  # skip BOS position
+            word_id = word_ids[j]
+            tag_id = tag_ids[j]
+
+            # all of these have two cases, for supervised and for unsupervised 
+            if tag_id is not None:  # supervised 
+                self.B_counts[tag_id, word_id] += mult
+                if j < T and tag_ids[j+1] is not None:
+                    self.A_counts[tag_id, tag_ids[j+1]] += mult
+            else:  # unsupervised 
+                # emission probabilities - this is likely wrng, need to troubleshoot
+                for t in valid_tags:
+                    log_posterior = self.alpha[j, t] + beta[j, t] - self.log_Z
+                    posterior = torch.exp(log_posterior)
+                    self.B_counts[t, word_id] += mult * posterior
+
+                # transition probabilities - these are doing really well 
+                if j < T:
+                    next_word = word_ids[j + 1]
+                    if tag_ids[j+1] is not None: 
+                        next_t = tag_ids[j+1]
+                        for s in valid_tags:
+                            log_posterior = (self.alpha[j, s] + 
+                                        log_A[s, next_t] + 
+                                        log_B[next_t, next_word] + 
+                                        beta[j + 1, next_t] - 
+                                        self.log_Z)
+                            posterior = torch.exp(log_posterior)
+                            self.A_counts[s, next_t] += mult * posterior
+                    else:  
+                        for s in valid_tags:
+                            for t in valid_tags:
+                                log_posterior = (self.alpha[j, s] + 
+                                            log_A[s, t] + 
+                                            log_B[t, next_word] + 
+                                            beta[j + 1, t] - 
+                                            self.log_Z)
+                                posterior = torch.exp(log_posterior)
+                                self.A_counts[s, t] += mult * posterior
+
+        # BOS transitions
+        if tag_ids[1] is not None: 
+            self.A_counts[self.bos_t, tag_ids[1]] += mult
+        else:  
+            for t in valid_tags:
+                log_posterior = log_A[self.bos_t, t] + log_B[t, word_ids[1]] + beta[1, t] - self.log_Z
+                posterior = torch.exp(log_posterior)
+                self.A_counts[self.bos_t, t] += mult * posterior
+
+        #  EOS transitions
+        if tag_ids[T] is not None:  # Last tag is known
+            self.A_counts[tag_ids[T], self.eos_t] += mult
+        else:  
             for s in valid_tags:
-                total_prob = float('-inf')
-                
-                # Sum over current tags
-                for t in valid_tags:
-                    if j == n + 1:  # special handling of EOS position
-                        if t == self.eos_t and self.A[s,t] > 0:
-                            p = torch.log(self.A[s,t])
-                            total_prob = torch.logsumexp(
-                                torch.tensor([total_prob, p + self.beta[j][t]]), dim=0)
-                    else:
-                        if self.A[s,t] > 0 and self.B[t,word_id] > 0:
-                            p = torch.log(self.A[s,t]) + torch.log(self.B[t,word_id])
-                            total_prob = torch.logsumexp(
-                                torch.tensor([total_prob, p + self.beta[j][t]]), dim=0)
-                
-                self.beta[j-1][s] = total_prob
-
-            # (similar to forward pass) scaling step 
-            if j > 1:  # don't scale BOS position
-                max_beta = torch.max(self.beta[j-1])
-                self.beta[j-1] = self.beta[j-1] - max_beta
-                log_scale += max_beta
-
-            # accum expected counts
-            if j < n + 1:  # skip EOS position for emissions
-                for t in valid_tags:
-                    if word_id < self.V:  # only count regular words
-                        posterior = torch.exp(
-                            self.alpha[j][t] + self.beta[j][t] - self.log_Z
-                        )
-                        self.B_counts[t,word_id] += mult * posterior
-                    
-                    # for the expected count of transitions
-                    for s in valid_tags:
-                        if self.A[s,t] > 0 and self.B[t,word_id] > 0:
-                            trans_prob = torch.exp(
-                                self.alpha[j-1][s] + 
-                                torch.log(self.A[s,t]) + 
-                                torch.log(self.B[t,word_id]) + 
-                                self.beta[j][t] - 
-                                self.log_Z
-                            )
-                            self.A_counts[s,t] += mult * trans_prob
-        
-        # same as previous fucntions, we handle BOS intitial transitions diff
-        for t in valid_tags:
-            if self.A[self.bos_t,t] > 0 and self.B[t,isent[1][0]] > 0:
-                trans_prob = torch.exp(
-                    self.alpha[0][self.bos_t] + 
-                    torch.log(self.A[self.bos_t,t]) + 
-                    torch.log(self.B[t,isent[1][0]]) + 
-                    self.beta[1][t] - 
-                    self.log_Z
-                )
-                self.A_counts[self.bos_t,t] += mult * trans_prob
-        
-        # this computation should match forward pass- we check this later 
-        log_Z_backward = self.beta[0][self.bos_t] + log_scale
-
-
+                log_posterior = self.alpha[T, s] + log_A[s, self.eos_t] - self.log_Z
+                posterior = torch.exp(log_posterior)
+                self.A_counts[s, self.eos_t] += mult * posterior
 
         return log_Z_backward
+
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
         """Find the most probable tagging for the given sentence, according to the
