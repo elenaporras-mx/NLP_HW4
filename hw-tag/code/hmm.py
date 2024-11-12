@@ -413,6 +413,7 @@ class HiddenMarkovModel:
         log_A = torch.log(self.A + 1e-10)
         log_B = torch.log(self.B + 1e-10)
 
+        
         # backward pass with scaling
         for j in range(T, -1, -1):
             for t_j in valid_tags:
@@ -430,8 +431,8 @@ class HiddenMarkovModel:
                         beta[j, t_j] = torch.logsumexp(torch.stack(scores), dim=0)
 
             # same scaling as forward pass with the reversed factors 
-            if j > 0:  # Don't scale at position 0
-               beta[j] = beta[j] - self.scaling_factors[j-1]
+            if j < T :  # don't scale at position 0
+               beta[j] = beta[j] - self.scaling_factors[j]
 
         self.beta = beta 
         log_Z_backward = torch.logsumexp(beta[0], dim=0) + sum(self.scaling_factors)
