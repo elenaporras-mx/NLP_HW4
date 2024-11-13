@@ -3,13 +3,16 @@
 Command-line interface for training and evaluating HMM and CRF taggers.
 """
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from itertools import product
 import logging
 from pathlib import Path
 from typing import Callable, Tuple, Union
 
+import numpy as np
 import torch
 from eval import model_cross_entropy, viterbi_error_rate, write_tagging
-from hmm import HiddenMarkovModel
+from hmm import HiddenMarkovModel, EnhancedHMM
 from crf import ConditionalRandomField
 from corpus import TaggedCorpus
 
@@ -80,6 +83,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="model should be only a unigram HMM or CRF (baseline)"
+    )
+
+    #for extra cred
+    modelgroup.add_argument(
+        "--decoder",
+        type=str,
+        default="viterbi",
+        choices=['viterbi', 'posterior'],
+        help="decoding method to use (viterbi or posterior)"
     )
     
     modelgroup.add_argument(
@@ -172,7 +184,32 @@ def parse_args() -> argparse.Namespace:
         help="model should encode context using recurrent neural nets with this hidden-state dimensionality (>= 0)"
     )
 
+    awesomegroup = parser.add_argument_group("Awesome mode options")
 
+    awesomegroup.add_argument(
+        "--awesome_decoder",
+        type=str,
+        default="hybrid",
+        choices=['viterbi', 'posterior', 'hybrid'],
+        help="decoding method to use"
+    )
+    awesomegroup.add_argument(
+        "--supervised_constraint",
+        action="store_true",
+        default=True,
+        help="use supervised tag constraints"
+    )
+    awesomegroup.add_argument(
+        "--smart_smoothing",
+        action="store_true",
+        default=True,
+        help="use differential smoothing based on tag characteristics"
+    )
+    awesomegroup.add_argument(
+        "--optimize_hyperparams",
+        action="store_true",
+        help="run hyperparameter optimization"
+    )
 
     args = parser.parse_args()
 
@@ -191,18 +228,69 @@ def parse_args() -> argparse.Namespace:
         args.output_file = args.input+"_output"
 
     # What kind of model should we build?        
-    if not args.crf:  # HMM
-        if args.lexicon or args.rnn_dim:
-            raise NotImplementedError("No neural HMM implemented (and it's not required)")
+    if not args.crf:
+        if args.awesome:
+            args.model_class = EnhancedHMM
         else:
             args.model_class = HiddenMarkovModel
+            if args.lexicon or args.rnn_dim:
+                raise NotImplementedError("Neural HMM not implemented")
     else:
-        if args.args.lexicon or args.rnn_dim:
-            args.model_class = NotImplemented  # for followup assignment
-        else: 
-            args.model_class = ConditionalRandomField        
+        args.model_class = ConditionalRandomField
+        if args.lexicon or args.rnn_dim:
+            raise NotImplementedError("Neural CRF not implemented")
+    
+
 
     return args
+
+#for extra cred
+def write_tagging(model: Union[HiddenMarkovModel, ConditionalRandomField], 
+                 corpus: TaggedCorpus, 
+                 output_file: Path,
+                 decoder: str = "viterbi") -> None:
+    """writes model predictions to file using specified decoding method"""
+    with open(output_file, 'w') as f:
+        for sentence in corpus:
+            # use appropriate tagging method based on model type
+            if hasattr(model, 'decode'):  # enhanced HMM
+                tagged = model.decode(sentence, corpus, method=decoder)
+            elif decoder == "viterbi":
+                tagged = model.viterbi_tagging(sentence, corpus)
+            else:  # posterior
+                tagged = model.posterior_tagging(sentence, corpus)
+            print(" ".join(f"{word}_{tag}" for word, tag in tagged), file=f)
+
+'''
+
+def optimize_hyperparams(model_class, train_corpus: TaggedCorpus, 
+                        dev_corpus: TaggedCorpus) -> dict:
+    """Find optimal hyperparameters using parallel grid search."""
+    param_grid = {
+        'λ': [0.01, 0.1, 0.5, 1.0, 2.0],
+        'decoder': ['viterbi', 'posterior', 'hybrid'],
+        'supervised_constraint': [True, False],
+        'smart_smoothing': [True, False]
+    }
+    
+    def evaluate_params(params):
+        model = model_class(train_corpus.tagset, train_corpus.vocab,
+                          supervised_constraint=params['supervised_constraint'],
+                          smart_smoothing=params['smart_smoothing'])
+        model.train(train_corpus, λ=params['λ'])
+        return model_cross_entropy(model, dev_corpus)
+    
+    # Parallel grid search using ProcessPoolExecutor
+    param_combinations = [dict(zip(param_grid.keys(), v)) 
+                         for v in product(*param_grid.values())]
+    
+    with ProcessPoolExecutor() as executor:
+        results = list(executor.map(evaluate_params, param_combinations))
+    
+    best_idx = np.argmin(results)
+    return param_combinations[best_idx]
+
+    '''
 
 def main() -> None:
     args = parse_args()
@@ -225,59 +313,60 @@ def main() -> None:
     torch.set_default_device(args.device)
         
     # Load or create the model, and load the training corpus.
-    # Make sure they have the same vocab and tagset.
-    train_paths = [Path(t) for t in args.train]
-    model_class = args.model_class
     if args.load_path:
-        # load an existing model of the required class and use its vocab/tagset
-        model = model_class.load(args.load_path, device=args.device) 
-        if model.unigram != args.unigram:
-            raise ValueError(f"Expected a {'unigram' if args.unigram else 'bigram'} model but got a " \
-                             f"{'unigram' if model.unigram else 'bigram'} model from saved file {args.model}.")
-        train_corpus = TaggedCorpus(*train_paths, tagset=model.tagset, vocab=model.vocab)
+        model = args.model_class.load(args.load_path, device=args.device)
+        train_corpus = TaggedCorpus(*[Path(t) for t in args.train], 
+                                  tagset=model.tagset, vocab=model.vocab)
     else:
-        # build a new model of the required class from scratch, taking vocab/tagset from training data
-        train_corpus = TaggedCorpus(*train_paths)
-        model = model_class(train_corpus.tagset, train_corpus.vocab, 
-                            unigram=args.unigram)
+        train_corpus = TaggedCorpus(*[Path(t) for t in args.train])
+        model = args.model_class(
+            train_corpus.tagset,
+            train_corpus.vocab,
+            unigram=args.unigram
+        )
 
-    # Load the eval corpus, using the same vocab and tagset.
+    # prepare evaluation data
     eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
     
-    # Construct the loss function on the eval corpus (only makes sense if it's supervised).
-    if args.loss == 'cross_entropy': 
+    # setup loss function
+    if args.loss == 'cross_entropy':
         loss = lambda x: model_cross_entropy(x, eval_corpus)
-    elif args.loss == 'viterbi_error': 
+    else:
         loss = lambda x: viterbi_error_rate(x, eval_corpus, show_cross_entropy=False)
 
-    # Train on the training corpus, if non-empty.    
+    # train if needed
     if train_corpus:
-        if model_class==HiddenMarkovModel:
-            model.train(corpus=train_corpus,
-                        loss=loss,
-                        λ=args.λ,    # type: ignore
-                        tolerance=args.tolerance,
-                        max_steps=args.max_steps,
-                        save_path=args.save_path)
-        elif model_class==ConditionalRandomField:
-            model.train(corpus=train_corpus,
-                        loss=loss,
-                        minibatch_size=args.batch_size,
-                        eval_interval=args.eval_interval,
-                        lr=args.lr,
-                        reg=args.reg,
-                        tolerance=args.tolerance,
-                        max_steps=args.max_steps,
-                        save_path=args.save_path)
-        else:
-            # in the followup homework, add a case for your neural CRF class,
-            # but still raise NotImplementedError for anything else
-            raise NotImplementedError   # you fill this in!
+        if isinstance(model, (HiddenMarkovModel, EnhancedHMM)):
+            model.train(
+                corpus=train_corpus,
+                loss=loss,
+                λ=args.λ,
+                tolerance=args.tolerance,
+                max_steps=args.max_steps,
+                save_path=args.save_path
+            )
+        elif isinstance(model, ConditionalRandomField):
+            model.train(
+                corpus=train_corpus,
+                loss=loss,
+                minibatch_size=args.batch_size,
+                eval_interval=args.eval_interval,
+                lr=args.lr,
+                reg=args.reg,
+                tolerance=args.tolerance,
+                max_steps=args.max_steps,
+                save_path=args.save_path
+            )
                      
-    # Evaluate on dev data
-    loss(model)     # evaluate the loss, printing the evaluation using the logger
-    write_tagging(model, eval_corpus, Path(args.output_file))
-    logging.info(f"Wrote tagging to {args.output_file}")
-    
+    # evaluate and save predictions
+    loss(model)
+    write_tagging(
+        model, 
+        eval_corpus, 
+        Path(args.output_file),
+        decoder=args.decoder if args.awesome else "viterbi"
+    )
+    logging.info(f"Wrote {args.decoder} tagging to {args.output_file}")
+
 if __name__ == "__main__":
     main()

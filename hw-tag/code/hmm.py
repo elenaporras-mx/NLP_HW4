@@ -4,6 +4,7 @@
 # Starter code for Hidden Markov Models.
 
 from __future__ import annotations
+from collections import defaultdict
 import logging
 from math import inf, log, exp
 from pathlib import Path
@@ -98,7 +99,13 @@ class HiddenMarkovModel:
         # which don't have columns in this matrix).
         ###
 
-        WB = 0.01*torch.rand(self.k, self.V)  # choose random logits
+        WB = 0.1*torch.rand(self.k, self.V)  # I added a slightly larger scale to help break initial symmetry
+
+        # bias term to make each tag slightly prefer certain words initially
+        for t in range(self.k):
+            word_subset = torch.randperm(self.V)[:self.V // self.k]  # assign some words to each tag
+            WB[t, word_subset] += 1.0 
+        #this is same 
         self.B = WB.softmax(dim=1)            # construct emission distributions p(w | t)
         self.B[self.eos_t, :] = 0             # EOS_TAG can't emit any column's word
         self.B[self.bos_t, :] = 0             # BOS_TAG can't emit any column's word
@@ -106,10 +113,18 @@ class HiddenMarkovModel:
         ###
         # Randomly initialize transition probabilities, in a similar way.
         # Again, we respect the structural zeros of the model.
+
+        #I also tweaked this 
         ###
         
         rows = 1 if self.unigram else self.k
-        WA = 0.01*torch.rand(rows, self.k)
+        WA = 0.1*torch.rand(rows, self.k)
+        # iagonal bias to encourage some tag self-transitions
+        if not self.unigram:
+            WA += 0.5 * torch.eye(self.k)[:rows, :]
+        
+        WA[:, self.bos_t] = float('-inf')  # structural zeros
+        
         WA[:, self.bos_t] = -inf    # correct the BOS_TAG column
         self.A = WA.softmax(dim=1)  # construct transition distributions p(t | s)
         if self.unigram:
@@ -185,19 +200,9 @@ class HiddenMarkovModel:
             smoothed_A[self.eos_t, :] = 0
 
             row_sums = smoothed_A.sum(dim=1, keepdim=True)
-            # for zero rows
-            mask = (row_sums > 0).squeeze()
-
-            self.A = torch.zeros_like(smoothed_A)
+            row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
+            self.A = smoothed_A / row_sums
             
-            # normalize non-zero rows
-            self.A[mask] = smoothed_A[mask] / row_sums[mask]
-
-            # overkill (?) step 
-            row_sums = self.A.sum(dim=1, keepdim=True)
-            mask = (row_sums > 0).squeeze()
-            if mask.any():
-                self.A[mask] = self.A[mask] / row_sums[mask]
         # debugging: print matrices after update
         #print("\nExpected counts A:")
         #print(self.A_counts)
@@ -407,8 +412,7 @@ class HiddenMarkovModel:
             log_posterior = self.alpha[T, valid_indices] + log_A[valid_indices, self.eos_t] - self.log_Z
             posterior = torch.exp(log_posterior)
             self.A_counts[valid_indices, self.eos_t] += mult * posterior
-
-        
+    
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
         """Run the forward algorithm from the handout on a tagged, untagged, 
@@ -598,8 +602,6 @@ class HiddenMarkovModel:
                 result.append((word, self.tagset[tags[tags_index]]))
                 tags_index += 1
         return Sentence(result)
-            
-
 
     def save(self, model_path: Path) -> None:
         logger.info(f"Saving model to {model_path}")
@@ -618,3 +620,198 @@ class HiddenMarkovModel:
 
         logger.info(f"Loaded model from {model_path}")
         return model
+
+    @typechecked
+    def posterior_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
+        """find the best tag for each position with posterior marginal probs."""
+        isent = self._integerize_sentence(sentence, corpus)
+        n = len(isent) - 2  # exclude BOS and EOS
+        
+        self.forward_pass(isent)
+        self.backward_pass(isent)
+        
+        valid_mask = torch.ones(self.k, dtype=torch.bool)
+        valid_mask[self.bos_t] = False
+        valid_mask[self.eos_t] = False
+        valid_indices = torch.where(valid_mask)[0]
+        
+        # find tag with highest posterior probability
+        tags = []
+        for j in range(1, n+1):  # skip bos and include up to last real word
+            log_posterior = self.alpha[j, valid_indices] + self.beta[j, valid_indices] - self.log_Z
+            
+            # get most probable tag
+            best_tag_idx = torch.argmax(log_posterior)
+            best_tag = valid_indices[best_tag_idx]
+            tags.append(best_tag)
+        
+        result = []
+        tags_index = 0
+        for j, (word, _) in enumerate(sentence):
+            if j == 0:  # BOS
+                result.append((word, BOS_TAG))
+            elif j == len(sentence) - 1:  # EOS
+                result.append((word, EOS_TAG))
+            else:
+                result.append((word, self.tagset[tags[tags_index]]))
+                tags_index += 1
+                
+        return Sentence(result)
+    
+
+@typechecked
+class EnhancedHMM(HiddenMarkovModel):
+    """ Decided to do the improvements this way because there were a few methods that just started looking
+    overgrown for lack of a better word """
+    
+    def __init__(self, tagset: Integerizer[Tag], 
+                vocab: Integerizer[Word], 
+                 unigram: bool = False, 
+                 supervised_constraint: bool = True,
+                 better_smoothing: bool = True):
+        super().__init__(tagset, vocab, unigram)
+        self.supervised_constraint = supervised_constraint
+        self.better_smoothing = better_smoothing
+        self.tag_word_counts = defaultdict(set)  # allowed tags per word
+        self.closed_class_tags = set()  # closed class tags
+        self.open_class_threshold = 5
+
+    def train(self, corpus: TaggedCorpus, *args, **kwargs):
+        """we extended this method to learn tag constraints from supervised data. 
+        So unfortunately this wont do too much for our purely unsupervised case, but it's really impressive for the others """
+        
+        # learn word-tag associations 
+        for sentence in corpus:
+            isent = self._integerize_sentence(sentence, corpus)
+            for word_id, tag_id in isent:
+                if tag_id is not None:
+                    self.tag_word_counts[word_id].add(tag_id)
+
+        # find tags that only appear with a small vocab
+        tag_vocab_sizes = defaultdict(set)
+        for word_id, tag_ids in self.tag_word_counts.items():
+            for tag_id in tag_ids:
+                tag_vocab_sizes[tag_id].add(word_id)
+
+        # mark tags as closed if they appear with few words
+        for tag_id, vocab in tag_vocab_sizes.items():
+            if len(vocab) < self.open_class_threshold:
+                self.closed_class_tags.add(tag_id)
+
+        super().train(corpus, *args, **kwargs)
+
+    def M_step(self, λ: float = 0.01) -> None:
+        """set the transition and emission matrices with bounds checking for vocabulary."""
+        if λ < 0:
+            raise ValueError("Smoothing parameter must be non-negative")
+        if not hasattr(self, 'A_counts') or not hasattr(self, 'B_counts'):
+            raise RuntimeError("No counts accumulated. Run E_step first.")
+
+        # Verify structural zeros agaaiiiiin
+        assert self.A_counts[:, self.bos_t].any() == 0
+        assert self.A_counts[self.eos_t, :].any() == 0
+        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0
+
+        if self.better_smoothing:
+            #  smoothing matrix - varies by tag type
+            B_smoothing = torch.full((self.k, self.V), λ)
+            for tag_id in self.closed_class_tags:
+                B_smoothing[tag_id, :] = λ * 0.1
+            smoothed_B = self.B_counts + B_smoothing
+            
+            #  supervised constraints if enabled
+            if self.supervised_constraint:
+                mask = torch.zeros((self.k, self.V), dtype=torch.bool)
+                for word_id, tag_ids in self.tag_word_counts.items():
+                    # skip words that are outside our vocabulary size
+                    if word_id >= self.V:
+                        continue
+                    for tag_id in tag_ids:
+                        if tag_id >= self.k:
+                            continue
+                        mask[tag_id, word_id] = True
+                smoothed_B = torch.where(mask, smoothed_B, torch.zeros_like(smoothed_B))
+        else:
+            # simple as the fallback case
+            smoothed_B = self.B_counts.clone()
+            smoothed_B[:self.eos_t] += λ
+
+        # norm emission 
+        row_sums_B = smoothed_B.sum(dim=1, keepdim=True)
+        row_sums_B = torch.where(row_sums_B == 0, torch.ones_like(row_sums_B), row_sums_B)
+        self.B = smoothed_B / row_sums_B
+        self.B[self.eos_t:, :] = 0
+
+        # handle transitions
+        if self.unigram:
+            row_counts = self.A_counts.sum(dim=0) + λ
+            WA = torch.log(row_counts + 1e-10).unsqueeze(0)
+            WA[:, self.bos_t] = -float('inf')
+            self.A = WA.softmax(dim=1)
+            self.A = self.A.repeat(self.k, 1)
+        else:
+            # transition smoothing matrix 
+            A_smoothing = torch.full((self.k, self.k), λ)
+            A_smoothing[:, self.bos_t] = 0
+            A_smoothing[self.eos_t, :] = 0
+        
+            smoothed_A = self.A_counts + A_smoothing
+
+            smoothed_A[:, self.bos_t] = 0
+            smoothed_A[self.eos_t, :] = 0
+            
+            # norming
+            row_sums_A = smoothed_A.sum(dim=1, keepdim=True)
+            row_sums_A = torch.where(row_sums_A == 0, torch.ones_like(row_sums_A), row_sums_A)
+            self.A = smoothed_A / row_sums_A
+
+        # Verify probabilities sum to 1
+        A_row_sums = self.A[:self.eos_t].sum(dim=1)
+        B_row_sums = self.B[:self.eos_t].sum(dim=1)
+        assert torch.allclose(A_row_sums, torch.ones_like(A_row_sums), rtol=1e-3)
+        assert torch.allclose(B_row_sums, torch.ones_like(B_row_sums), rtol=1e-3)
+    
+    def decode(self, sentence: Sentence, corpus: TaggedCorpus, method: str = 'viterbi') -> Sentence:
+        """picks best tags for a sentence. can use viterbi, posterior, or hybrid method.
+        hybrid uses constraints for known words and posterior for unknowns - usually works best."""
+        
+        if method == 'viterbi':
+            return self.viterbi_tagging(sentence, corpus)
+        elif method == 'posterior':
+            return self.posterior_tagging(sentence, corpus)
+        elif method == 'hybrid':
+            # we got inspired by the mix of training files so this will use 
+            # constraints for known words, posterior for unknown
+            isent = self._integerize_sentence(sentence, corpus)
+            self.forward_pass(isent)
+            self.backward_pass(isent)
+            
+            tags = []
+            for j, (word_id, _) in enumerate(isent[1:-1], 1):
+                if word_id in self.tag_word_counts:
+                    # for known words, only consider tags we've seen before
+                    allowed_tags = list(self.tag_word_counts[word_id])
+                    log_probs = (self.alpha[j, allowed_tags] + 
+                            self.beta[j, allowed_tags] - 
+                            self.log_Z)  
+                    best_idx = torch.argmax(log_probs)
+                    tags.append(allowed_tags[best_idx])
+                else:
+                    # for unknown words, use posterior over all tags
+                    log_probs = (self.alpha[j] + self.beta[j] - self.log_Z)
+                    tags.append(torch.argmax(log_probs).item())
+        
+            result = []
+            tags_index = 0
+            for j, (word, _) in enumerate(sentence):
+                if j == 0:
+                    result.append((word, BOS_TAG))
+                elif j == len(sentence) - 1:
+                    result.append((word, EOS_TAG))
+                else:
+                    result.append((word, self.tagset[tags[tags_index]]))
+                    tags_index += 1
+            
+            return Sentence(result)
+        else:
+            raise ValueError(f"Unknown decoding method: {method}")
