@@ -65,7 +65,41 @@ class ConditionalRandomField(HiddenMarkovModel):
         # For a unigram model, self.WA should just have a single row:
         # that model has fewer parameters.
 
-        raise NotImplementedError   # you fill this in!
+        ###
+        # Randomly initialize emission probabilities.
+        # A row for an ordinary tag holds a distribution that sums to 1 over the columns.
+        # But EOS_TAG and BOS_TAG have probability 0 of emitting any column's word
+        # (instead, they have probability 1 of emitting EOS_WORD and BOS_WORD (respectively), 
+        # which don't have columns in this matrix).
+        ###
+
+        #copied from hmm init_params
+        #EMISSIONS
+        self.WB = 0.01*torch.rand(self.k, self.V)  # choose random logits
+        #self.B = self.WB.softmax(dim=1)            # construct emission distributions p(w | t)
+        self.WB[self.eos_t, :] = -1e10             # EOS_TAG can't emit any column's word
+        self.WB[self.bos_t, :] = -1e10             # BOS_TAG can't emit any column's word
+        
+        ###
+        # Randomly initialize transition probabilities, in a similar way.
+        # Again, we respect the structural zeros of the model.
+        ###
+        
+        rows = 1 if self.unigram else self.k
+        self.WA = 0.01*torch.rand(rows, self.k) #kxk
+        self.WA[:, self.bos_t] = -1e10    # correct the BOS_TAG column
+        #self.A = self.WA.softmax(dim=1)  # construct transition distributions p(t | s)
+        #if self.unigram:
+            # A unigram model really only needs a vector of unigram probabilities
+            # p(t), but we'll construct a bigram probability matrix p(t | s) where 
+            # p(t | s) doesn't depend on s. 
+            # 
+            # By treating a unigram model as a special case of a bigram model,
+            # we can simply use the bigram code for our unigram experiments,
+            # although unfortunately that preserves the O(nk^2) runtime instead
+            # of letting us speed up to O(nk) in the unigram case.
+        #    self.A = self.A.repeat(self.k, 1)   # copy the single row k times
+            
         self.updateAB()   # compute potential matrices
 
     def updateAB(self) -> None:
@@ -77,9 +111,13 @@ class ConditionalRandomField(HiddenMarkovModel):
         # you should make a full k × k matrix A of transition potentials,
         # so that the forward-backward code will still work.
         # See init_params() in the parent class for discussion of this point.
+        if self.unigram:
+            self.WA = self.WA.repeat(self.k, 1)
         
-        raise NotImplementedError   # you fill this in!
-
+        self.A = torch.exp(self.WA)
+        self.B = torch.exp(self.WB)
+        # need some way for WA, WB to be updated in the first place... 
+        
     @override
     def train(self,
               corpus: TaggedCorpus,
@@ -123,7 +161,7 @@ class ConditionalRandomField(HiddenMarkovModel):
         # This is relatively generic training code.  Notice that the
         # updateAB() step before each minibatch produces A, B matrices
         # that are then shared by all sentences in the minibatch.
-        #
+        # 
         # All of the sentences in a minibatch could be treated in
         # parallel, since they use the same parameters.  The code
         # below treats them in series -- but if you were using a GPU,
@@ -139,7 +177,7 @@ class ConditionalRandomField(HiddenMarkovModel):
             minibatch_size = len(corpus)  # no point in having a minibatch larger than the corpus
         min_steps = len(corpus)   # always do at least one epoch
 
-        self.init_params()    # initialize the parameters and call updateAB()
+        #self.init_params()    # initialize the parameters and call updateAB()
         self._zero_grad()     # get ready to accumulate their gradient
         steps = 0
         old_loss = _loss()    # evaluate initial loss
@@ -194,7 +232,12 @@ class ConditionalRandomField(HiddenMarkovModel):
         # in order to compute the normalizing constant for this sentence.
         desup_isent = self._integerize_sentence(sentence.desupervise(), corpus)
 
-        raise NotImplementedError   # you fill this in!
+        # NOT SURE: just forward pass?? i think we can use this because it will return the alphaEOS
+        prob = self.forward_pass(isent) #just this sentence i.e. (p(t, w))
+        Z = self.forward_pass(desup_isent) #desupervised to calculate all possible taggings for this sentence (p(w))
+        
+        log_prob_cond = prob/Z #conditional log prob: log p(t | w)
+        print(log_prob_cond)
 
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
         """Add the gradient of self.logprob(sentence, corpus) into a total minibatch
@@ -212,9 +255,11 @@ class ConditionalRandomField(HiddenMarkovModel):
         isent_sup   = self._integerize_sentence(sentence, corpus)
         isent_desup = self._integerize_sentence(sentence.desupervise(), corpus)
 
-        # Hint: use the mult argument to E_step().
-        raise NotImplementedError   # you fill this in!
+        # Hint: use the mult argument to E_step(). <-- clever!!
         
+        self.E_step(isent_sup, mult = 1) #find observered counts
+        self.E_step(isent_desup, mult = -1) #find expected counts and "subtract" from A_counts (?) check! -vv
+            
     def _zero_grad(self):
         """Reset the gradient accumulator to zero."""
         # You'll have to override this method in the next homework; 
@@ -229,7 +274,22 @@ class ConditionalRandomField(HiddenMarkovModel):
         # is only a vector of tag unigram potentials (even though self.A_counts
         # is a still a matrix of tag bigram potentials).
         
-        raise NotImplementedError   # you fill this in!
+        #copied from HMM init_params 
+        if self.unigram:
+            # A unigram model really only needs a vector of unigram probabilities
+            # p(t), but we'll construct a bigram probability matrix p(t | s) where 
+            # p(t | s) doesn't depend on s. 
+            # 
+            # By treating a unigram model as a special case of a bigram model,
+            # we can simply use the bigram code for our unigram experiments,
+            # although unfortunately that preserves the O(nk^2) runtime instead
+            # of letting us speed up to O(nk) in the unigram case.
+            self.WA = self.WA.repeat(self.k, 1)   # copy the single row k times 
+            
+        # update parameters
+        self.WA += self.A_counts
+        self.WB += self.B_counts
+        #raise NotImplementedError   # you fill this in!
         
     def reg_gradient_step(self, lr: float, reg: float, frac: float):
         """Update the parameters using the gradient of our regularizer.
@@ -245,6 +305,8 @@ class ConditionalRandomField(HiddenMarkovModel):
         # Warning: Be careful not to do something like w -= 0.1*w,
         # because some of the weights are infinite and inf - inf = nan. 
         # Instead, you want something like w *= 0.9.
-
-        raise NotImplementedError   # you fill this in!
+        
+        self.WA -= (-1 * lr *  reg / frac) * self.A
+        self.WB -= (-1 * lr *  reg / frac) * self.B
+        #adjust by gradient
     

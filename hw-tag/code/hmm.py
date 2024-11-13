@@ -168,7 +168,7 @@ class HiddenMarkovModel:
         self.B = self.B_counts / row_sums_B
         self.B[self.eos_t:, :] = 0
 
-        # transition probabilitiesmaybe overkill for normalization
+        # transition probabilities maybe overkill for normalization
         if self.unigram:
             row_counts = self.A_counts.sum(dim=0) + λ
             WA = torch.log(row_counts + 1e-10).unsqueeze(0)
@@ -308,7 +308,7 @@ class HiddenMarkovModel:
 
         # Integerize the words and tags of the given sentence, which came from the given corpus.
         isent = self._integerize_sentence(sentence, corpus)
-        return self.forward_pass(isent)
+        return self.forward_pass(isent) # (Z(w))
 
     def E_step(self, isent: IntegerizedSentence, mult: float = 1) -> None:
         """Runs the forward backward algorithm on the given sentence. The forward step computes
@@ -355,13 +355,13 @@ class HiddenMarkovModel:
             tag_id = tag_ids[j]
 
             # all of these have two cases, for supervised and for unsupervised 
-            if tag_id != -1:  # supervised 
+            if tag_id != -1:  # supervised # don't need to use alpha and beta probabilities, there's only one path through the trellis 
                 self.B_counts[tag_id, word_id] += mult
                 if j < T and tag_ids[j+1] != -1:
                     self.A_counts[tag_id, tag_ids[j+1]] += mult
-            else:  # unsupervised 
+            else:  # unsupervised # need to use alpha and beta probabilities 
                 # emission probabilities
-                log_posterior = self.alpha[j, valid_indices] + self.beta[j, valid_indices] - self.log_Z
+                log_posterior = self.alpha[j, valid_indices] + self.beta[j, valid_indices] - self.log_Z # probability of getting the
                 posterior = torch.exp(log_posterior)
                 self.B_counts[valid_indices, word_id] += mult * posterior
 
