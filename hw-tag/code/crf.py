@@ -357,3 +357,11 @@ class ConditionalRandomField(HiddenMarkovModel):
         #self.WB -= (-1 * lr *  reg / frac) * self.B
         #adjust by gradient
     
+    def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
+        """Find the most probable tagging for the given sentence, according to the current model."""
+        # use the parent's viterbi
+        return super().viterbi_tagging(sentence, corpus)
+    def posterior_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
+        """Find the most probable tagging for the given sentence, according to the current model."""
+        # use the parent's posterior
+        return super().posterior_tagging(sentence, corpus)

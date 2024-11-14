@@ -555,7 +555,7 @@ class HiddenMarkovModel:
 
         # for position 1, first word after BOS handle more efficiently 
         word_id = word_ids[0]
-        scores_1 = alpha[0, self.bos_t] + log_A[self.bos_t, valid_indices] + log_B[valid_indices, word_id]
+        scores_1 = log_A[self.bos_t, valid_indices] + log_B[valid_indices, word_id]
         alpha[1, valid_indices] = scores_1
         backpointers[1, valid_indices] = self.bos_t
 
@@ -582,25 +582,23 @@ class HiddenMarkovModel:
         # backtracking
         tags = []
         current_tag = self.eos_t
-        for j in range(n + 1, 0, -1): 
+        for j in range(n + 1, 0, -1):
             prev_tag = backpointers[j, current_tag].item()
-            if prev_tag == -1:
-                raise ValueError(f"No valid path at position {j}")
-            if j != n + 1 and current_tag != self.eos_t and current_tag != self.bos_t:
+            if j != n + 1:  # don't include EOS tag
                 tags.insert(0, current_tag)
             current_tag = prev_tag
 
         # now include BOS and EOS
         result = []
-        tags_index = 0  
-        for j, (word, _) in enumerate(sentence):
-            if j == 0:  # BOS
-                result.append((word, BOS_TAG))
-            elif j == len(sentence) - 1:  # EOS
-                result.append((word, EOS_TAG))
+        for i, (word, _) in enumerate(sentence):
+            if i == 0:  
+                result.append((word, BOS_TAG))  # Use constant from corpus.py
+            elif i == len(sentence) - 1:
+                result.append((word, EOS_TAG))  # Use constant from corpus.py
             else:
-                result.append((word, self.tagset[tags[tags_index]]))
-                tags_index += 1
+                tag_idx = tags[i-1]
+                result.append((word, self.tagset[tag_idx]))
+
         return Sentence(result)
 
     def save(self, model_path: Path) -> None:
@@ -646,18 +644,16 @@ class HiddenMarkovModel:
             tags.append(best_tag)
         
         result = []
-        tags_index = 0
-        for j, (word, _) in enumerate(sentence):
-            if j == 0:  # BOS
-                result.append((word, BOS_TAG))
-            elif j == len(sentence) - 1:  # EOS
-                result.append((word, EOS_TAG))
+        for i, (word, _) in enumerate(sentence):
+            if i == 0:
+                result.append((word, BOS_TAG))  # Use constant from corpus.py
+            elif i == len(sentence) - 1:
+                result.append((word, EOS_TAG))  # Use constant from corpus.py
             else:
-                result.append((word, self.tagset[tags[tags_index]]))
-                tags_index += 1
-                
+                tag_idx = tags[i-1]
+                result.append((word, self.tagset[tag_idx]))
+        
         return Sentence(result)
-    
 
 @typechecked
 class EnhancedHMM(HiddenMarkovModel):
@@ -797,20 +793,25 @@ class EnhancedHMM(HiddenMarkovModel):
                     best_idx = torch.argmax(log_probs)
                     tags.append(allowed_tags[best_idx])
                 else:
+                    valid_mask = torch.ones(self.k, dtype=torch.bool)
+                    valid_mask[self.bos_t] = False
+                    valid_mask[self.eos_t] = False
+                    valid_indices = torch.where(valid_mask)[0]
                     # for unknown words, use posterior over all tags
-                    log_probs = (self.alpha[j] + self.beta[j] - self.log_Z)
-                    tags.append(torch.argmax(log_probs).item())
+                    log_probs = self.alpha[j, valid_indices] + self.beta[j, valid_indices] - self.log_Z
+                    best_idx = torch.argmax(log_probs)
+                    tags.append(valid_indices[best_idx])
         
             result = []
-            tags_index = 0
-            for j, (word, _) in enumerate(sentence):
-                if j == 0:
+            for i, (word, _) in enumerate(sentence):
+                if i == 0:  # BOS
                     result.append((word, BOS_TAG))
-                elif j == len(sentence) - 1:
+                elif i == len(sentence) - 1:  # EOS
                     result.append((word, EOS_TAG))
                 else:
-                    result.append((word, self.tagset[tags[tags_index]]))
-                    tags_index += 1
+                    # Convert tag index to actual tag using tagset
+                    tag_idx = tags[i-1]  # -1 because we don't include BOS
+                    result.append((word, self.tagset[tag_idx]))
             
             return Sentence(result)
         else:

@@ -250,16 +250,33 @@ def write_tagging(model: Union[HiddenMarkovModel, ConditionalRandomField],
                  output_file: Path,
                  decoder: str = "viterbi") -> None:
     """writes model predictions to file using specified decoding method"""
-    with open(output_file, 'w') as f:
-        for sentence in corpus:
-            # use appropriate tagging method based on model type
-            if hasattr(model, 'decode'):  # enhanced HMM
-                tagged = model.decode(sentence, corpus, method=decoder)
-            elif decoder == "viterbi":
-                tagged = model.viterbi_tagging(sentence, corpus)
-            else:  # posterior
-                tagged = model.posterior_tagging(sentence, corpus)
-            print(" ".join(f"{word}_{tag}" for word, tag in tagged), file=f)
+    logging.info(f"Writing predictions to {output_file} using {decoder} decoder")
+    
+    try:
+        with open(output_file, 'w') as f:
+            for i, sentence in enumerate(corpus):
+                try:
+                    #  tagged sentence based on model type and decoder
+                    if isinstance(model, EnhancedHMM):
+                        tagged = model.decode(sentence, corpus, method=decoder)
+                    else:
+                        if decoder == "viterbi":
+                            tagged = model.viterbi_tagging(sentence, corpus)
+                        elif decoder == "posterior":
+                            tagged = model.posterior_tagging(sentence, corpus)
+                        else:
+                            raise ValueError(f"Unknown decoder type: {decoder}")
+                    
+                    #  tagged sentence
+                    print(" ".join(f"{word}_{tag}" for word, tag in tagged), file=f)
+                    
+                except Exception as e:
+                    logging.warning(f"Error tagging sentence {i}: {str(e)}")
+                    continue
+                    
+    except Exception as e:
+        logging.error(f"Error writing to {output_file}: {str(e)}")
+        raise
 
 '''
 
@@ -312,61 +329,97 @@ def main() -> None:
             exit(1)
     torch.set_default_device(args.device)
         
-    # Load or create the model, and load the training corpus.
-    if args.load_path:
-        model = args.model_class.load(args.load_path, device=args.device)
-        train_corpus = TaggedCorpus(*[Path(t) for t in args.train], 
-                                  tagset=model.tagset, vocab=model.vocab)
-    else:
-        train_corpus = TaggedCorpus(*[Path(t) for t in args.train])
-        model = args.model_class(
-            train_corpus.tagset,
-            train_corpus.vocab,
-            unigram=args.unigram
-        )
+    try:
+        if args.load_path:
+            logging.info(f"Loading existing model from {args.load_path}")
+            model = args.model_class.load(args.load_path, device=args.device)
+            train_corpus = TaggedCorpus(*[Path(t) for t in args.train], 
+                                      tagset=model.tagset, vocab=model.vocab)
+        else:
+            # load training corpus to get tagset and vocab
+            if args.train:
+                logging.info(f"Creating corpus from training files: {args.train}")
+                train_corpus = TaggedCorpus(*[Path(t) for t in args.train])
+                logging.info(f"Created corpus with {len(train_corpus.tagset)} tags and {len(train_corpus.vocab)} words")
+            else:
+                logging.info(f"Creating corpus from input file: {args.input}")
+                train_corpus = TaggedCorpus(Path(args.input))
+                logging.info(f"Created corpus with {len(train_corpus.tagset)} tags and {len(train_corpus.vocab)} words")
 
-    # prepare evaluation data
-    eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
-    
-    # setup loss function
-    if args.loss == 'cross_entropy':
-        loss = lambda x: model_cross_entropy(x, eval_corpus)
-    else:
-        loss = lambda x: viterbi_error_rate(x, eval_corpus, show_cross_entropy=False)
+            #  model according to type
+            logging.info(f"Initializing new {args.model_class.__name__}")
+            model = args.model_class(
+                train_corpus.tagset,
+                train_corpus.vocab,
+                unigram=args.unigram
+            )
 
-    # train if needed
-    if train_corpus:
-        if isinstance(model, (HiddenMarkovModel, EnhancedHMM)):
-            model.train(
-                corpus=train_corpus,
-                loss=loss,
-                λ=args.λ,
-                tolerance=args.tolerance,
-                max_steps=args.max_steps,
-                save_path=args.save_path
-            )
-        elif isinstance(model, ConditionalRandomField):
-            model.train(
-                corpus=train_corpus,
-                loss=loss,
-                minibatch_size=args.batch_size,
-                eval_interval=args.eval_interval,
-                lr=args.lr,
-                reg=args.reg,
-                tolerance=args.tolerance,
-                max_steps=args.max_steps,
-                save_path=args.save_path
-            )
-                     
-    # evaluate and save predictions
-    loss(model)
-    write_tagging(
-        model, 
-        eval_corpus, 
-        Path(args.output_file),
-        decoder=args.decoder if args.awesome else "viterbi"
-    )
-    logging.info(f"Wrote {args.decoder} tagging to {args.output_file}")
+        # evaluation data, sharing tagset and vocab with model
+        logging.info(f"Loading evaluation data from {args.input}")
+        eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
+        
+        # same as given
+        if args.loss == 'cross_entropy':
+            loss = lambda x: model_cross_entropy(x, eval_corpus)
+            logging.info("Using cross-entropy loss for evaluation")
+        else:
+            loss = lambda x: viterbi_error_rate(x, eval_corpus, show_cross_entropy=False)
+            logging.info("Using Viterbi error rate for evaluation")
+
+        # train if needed 
+        if args.train:
+            logging.info("Starting training...")
+            
+            # these are common
+            train_params = {
+                "corpus": train_corpus,
+                "loss": loss,
+                "tolerance": args.tolerance,
+                "max_steps": args.max_steps,
+                "save_path": args.save_path
+            }
+            
+            if isinstance(model, ConditionalRandomField):
+
+                train_params.update({
+                    "minibatch_size": args.batch_size,
+                    "eval_interval": args.eval_interval,
+                    "lr": args.lr,
+                    "reg": args.reg
+                })
+                logging.info(f"Training CRF with parameters: lr={args.lr}, reg={args.reg}, "
+                           f"batch_size={args.batch_size}, eval_interval={args.eval_interval}")
+            else:
+                # for only hmm
+                train_params.update({
+                    "λ": args.λ
+                })
+                logging.info(f"Training HMM with lambda={args.λ}")
+            
+            # select the right train params
+            model.train(**train_params)
+            logging.info("Training completed")
+
+        logging.info("Evaluating model...")
+        eval_result = loss(model)
+        logging.info(f"Evaluation result: {eval_result}")
+        
+        #use the right decoder
+        if args.awesome:
+            decoder = args.awesome_decoder
+            logging.info(f"Using awesome decoder: {decoder}")
+        else:
+            decoder = args.decoder
+            logging.info(f"Using standard decoder: {decoder}")
+        
+        output_path = Path(args.output_file)
+        write_tagging(model, eval_corpus, output_path, decoder=decoder)
+        logging.info(f"Wrote {decoder} tagging to {output_path}")
+
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        logging.debug("Details:", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()
